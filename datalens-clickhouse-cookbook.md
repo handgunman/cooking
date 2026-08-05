@@ -6,6 +6,21 @@
 Все примеры выполняются на одном сквозном наборе данных: таблица
 `financial_transactions` на 50 млн строк.
 
+> **Об условиях замеров.** Все `-- N rows in set. Elapsed...` в этом файле
+> получены на реальном инстансе Managed Service for ClickHouse минимальной
+> конфигурации (8 vCPU / 32 GB, как рекомендовано в 0.1). Это ориентировочные
+> цифры, а не результат строгого бенчмарка:
+> - кэши (mark, uncompressed, filesystem) между сравниваемыми запросами не
+>   сбрасывались — `SYSTEM DROP CACHE` не выполнялся;
+> - на запрос — один прогон, без warm-up и без усреднения по нескольким
+>   попыткам;
+> - инстанс шэренный (managed-сервис), в моменте замеров конкурентная
+>   нагрузка от чужих запросов была низкой, но не нулевой.
+>
+> Ориентируйтесь на порядок величин и на то, какой путь чтения выбрал
+> оптимизатор, а не на конкретные секунды — на своих данных и своём железе
+> числа будут другими.
+
 ## Оглавление
 
 - 00. Почему под BI берут колоночную СУБД
@@ -674,6 +689,7 @@ ALTER TABLE financial_transactions
     MATERIALIZE PROJECTION idx_by_transaction_id;
 
 -- Пример запроса использующего проекцию
+-- подставьте существующее значение transaction_id (диапазон 1..50 000 000)
 SELECT
     transaction_id,
     account_id,
@@ -681,17 +697,11 @@ SELECT
     status,
     transaction_date
 FROM financial_transactions
-WHERE transaction_id = 123456789;
+WHERE transaction_id = 12345678;
 
--- 0 rows in set. Elapsed: 0.103 sec. Processed 50.00 million rows, 400.00 MB (485.44 million rows/s., 3.88 GB/s.)
--- Peak memory usage: 4.84 MiB.
--- ВНИМАНИЕ: transaction_id = 123456789 отсутствует в сгенерированных данных
--- (значения идут от 1 до 50 000 000), результат ожидаемо пустой.
-
--- Тот же запрос с реально существующим transaction_id = 12345678:
 -- 1 rows in set. Elapsed: 0.107 sec. Processed 50.00 million rows, 400.00 MB (467.29 million rows/s., 3.74 GB/s.)
 -- Peak memory usage: 5.89 MiB.
--- ВАЖНО: даже на существующем значении полный скан не исчезает. EXPLAIN indexes = 1
+-- ВАЖНО: полный скан не исчезает даже на существующем значении. EXPLAIN indexes = 1
 -- показывает, что запрос читается из проекции prj_order_by_risk (Condition: true,
 -- Parts: 115/115) — planner выбрал более раннюю по порядку добавления normal-проекцию
 -- вместо idx_by_transaction_id, и настройка max_projection_rows_to_use_projection_index
