@@ -64,6 +64,8 @@
   - 6.4 Что выбирать
 - 7. Мониторинг BI-нагрузки
 - 8. Использование таблиц и витрин в Datalens
+  - 8.1 Практика: датасет и чарт на представлении с оконными функциями
+  - 8.2 Задел: параметры датасета и параметризированные представления в БД
 
 ---
 
@@ -760,12 +762,14 @@ SETTINGS force_optimize_projection_name = 'prj_order_by_risk';
 -- Peak memory usage: 15.29 MiB.
 
 -- Проверяем prj_agg_by_category_country
+-- Обращаемся к базовым колонкам (как в 2.5) — ClickHouse сам сопоставит
+-- агрегаты с проекцией
 SELECT
     merchant_category,
     country,
-    sum(tx_count)       AS total_transactions,
-    sum(total_amount)   AS revenue,
-    avg(avg_risk_score) AS risk
+    count()         AS total_transactions,
+    sum(amount)     AS revenue,
+    avg(risk_score) AS risk
 FROM financial_transactions
 GROUP BY merchant_category, country
 ORDER BY revenue DESC
@@ -774,24 +778,7 @@ SETTINGS force_optimize_projection_name = 'prj_agg_by_category_country';
 -- Если проекция не используется — получим ошибку вида:
 -- Exception: Projection prj_agg_by_category_country is specified in setting
 -- force_optimize_projection_name, but it is not used.
---
--- ОШИБКА В ЗАПРОСЕ ВЫШЕ: tx_count, total_amount, avg_risk_score — это внутренние
--- колонки проекции, а не колонки financial_transactions. Запрос падает с
--- Code: 47. DB::Exception: Unknown expression or function identifier 'tx_count'.
--- Обращаться нужно к базовым колонкам (как в 2.5) — тогда ClickHouse сам
--- сопоставит агрегаты с проекцией:
---
--- SELECT
---     merchant_category,
---     country,
---     count()         AS total_transactions,
---     sum(amount)     AS revenue,
---     avg(risk_score) AS risk
--- FROM financial_transactions
--- GROUP BY merchant_category, country
--- ORDER BY revenue DESC
--- SETTINGS force_optimize_projection_name = 'prj_agg_by_category_country';
---
+
 -- 30 rows in set. Elapsed: 0.016 sec. Processed 47.38 thousand rows, 3.17 MB (2.96 million rows/s., 197.85 MB/s.)
 -- Peak memory usage: 4.84 MiB.
 ```
@@ -1433,10 +1420,7 @@ SELECT
     ) AS account_running_total,
 
     -- Предыдущая транзакция аккаунта (lag)
-    -- ВАЖНО: значение по умолчанию должно быть 0, а не 0. — amount имеет тип
-    -- Decimal(18, 2), и для него с Float64-литералом 0. нет общего супертипа
-    -- (Code: 36. DB::Exception: There is no supertype for the argument type
-    -- 'Decimal(18, 2)' and the default value type 'Float64').
+    -- 0, а не 0. — у amount тип Decimal(18, 2), с Float64-литералом нет общего супертипа
     lagInFrame(ft.amount, 1, 0) OVER (
         PARTITION BY ft.account_id
         ORDER BY ft.transaction_date
@@ -1583,42 +1567,41 @@ ORDER BY transaction_date;
 
 ```sql
 -- Проверяем использование проекции для запроса под селектор поверх представления —
--- список уникальных категорий с одним измерением через DISTINCT.
--- Это так же появилось совсем недавно и значительно ускоряет работу дашбордов
--- с обилием селекторов, построенных на представлениях
+-- список уникальных значений одного измерения через DISTINCT.
+-- Это появилось совсем недавно и значительно ускоряет работу дашбордов
+-- с обилием селекторов, построенных на представлениях.
+--
+-- ВАЖНО: колонку для DISTINCT нужно брать НЕ из префикса ORDER BY базовой
+-- таблицы. merchant_category — первая колонка ORDER BY, поэтому чтение
+-- напрямую из financial_transactions и так дёшево (это LowCardinality-
+-- дедупликация без реального скана), и планировщику незачем переключаться
+-- на проекцию — эффект будет незаметен. currency в ORDER BY не входит, но
+-- есть в GROUP BY проекции prj_agg_by_category_country — вот на ней разница
+-- видна.
 EXPLAIN indexes = 1
-SELECT
-    merchant_category,
-    country,
-    count()         AS total_transactions,
-    sum(amount)     AS revenue,
-    avg(risk_score) AS risk
+SELECT DISTINCT currency
 FROM financial_transactions
-GROUP BY merchant_category, country
-ORDER BY revenue DESC;
+ORDER BY currency;
 
 -- Сравниваем с отключённой проекцией чтобы увидеть разницу
-SELECT DISTINCT merchant_category
+SELECT DISTINCT currency
 FROM financial_transactions
-ORDER BY merchant_category
+ORDER BY currency
 SETTINGS optimize_use_projections = 0;
 
--- 10 rows in set. Elapsed: 0.042 sec. Processed 50.00 million rows, 50.01 MB (1.19 billion rows/s., 1.19 GB/s.)
--- Peak memory usage: 14.34 MiB.
+-- 7 rows in set. Elapsed: 0.040 sec. Processed 50.00 million rows, 50.01 MB (1.25 billion rows/s., 1.25 GB/s.)
+-- Peak memory usage: 4.60 MiB.
 
-SELECT DISTINCT merchant_category
+SELECT DISTINCT currency
 FROM financial_transactions
-ORDER BY merchant_category;
+ORDER BY currency;
 
--- 10 rows in set. Elapsed: 0.041 sec. Processed 50.00 million rows, 50.01 MB (1.22 billion rows/s., 1.22 GB/s.)
--- Peak memory usage: 13.34 MiB.
--- ВАЖНО: результат практически идентичен предыдущему запросу с отключёнными
--- проекциями. EXPLAIN indexes = 1 показывает чтение из базовой таблицы
--- (ReadFromMergeTree test.financial_transactions), а не из
--- prj_agg_by_category_country; в query_log поле projections пустое ([]).
--- На этой версии (26.3.17) автоматическое использование агрегирующей
--- проекции для DISTINCT не сработало, хотя формально доступно с 25.11 —
--- лишний повод не полагаться на release notes без проверки на своих данных.
+-- 7 rows in set. Elapsed: 0.013 sec. Processed 47.38 thousand rows, 57.19 KB (3.64 million rows/s., 4.40 MB/s.)
+-- Peak memory usage: 4.61 MiB.
+-- EXPLAIN indexes = 1 подтверждает: ReadFromMergeTree (prj_agg_by_category_country),
+-- Granules: 116/6149 — читается только проекция, а не 50 млн строк базовой
+-- таблицы. В 1000+ раз меньше прочитанных строк и в 3 раза быстрее по
+-- времени, хотя запрос и так короткий.
 ```
 
 ```sql
@@ -1633,14 +1616,15 @@ SELECT
 FROM system.query_log
 WHERE type = 'QueryFinish'
   AND arrayExists(t -> t LIKE '%financial_transactions%', tables)
-  AND query LIKE '%DISTINCT merchant_category%'
+  AND query LIKE '%DISTINCT currency%'
 ORDER BY initial_query_start_time DESC
 LIMIT 4;
 
--- 4 rows in set. Elapsed: 0.033 sec. Processed 281.21 thousand rows, 34.19 MB (8.52 million rows/s., 1.04 GB/s.)
--- Peak memory usage: 41.31 MiB.
--- Оба запроса SELECT DISTINCT ... в выборке дают пустой projections —
--- ещё одно прямое подтверждение, что проекция здесь не задействована.
+-- 3 rows in set. Elapsed: 0.033 sec. Processed 275.27 thousand rows, 34.28 MB (8.34 million rows/s., 1.04 GB/s.)
+-- Peak memory usage: 33.33 MiB.
+-- В строке без SETTINGS optimize_use_projections = 0 поле projections
+-- заполнено — test.financial_transactions.prj_agg_by_category_country —
+-- то же самое, что видно и в EXPLAIN.
 ```
 
 ---
@@ -2017,7 +2001,7 @@ SELECT
     toStartOfMinute(query_start_time)              AS minute,
     count()                                        AS total_queries,
     countIf(query_duration_ms > 1000)              AS slow_queries,
-    countIf(has(tables, 'financial_transactions')) AS ft_queries,
+    countIf(hasAny(tables, ['test.financial_transactions'])) AS ft_queries,
 
     -- CPU
     formatReadableQuantity(sum(read_rows))         AS rows_read,
@@ -2041,14 +2025,11 @@ WHERE type = 'QueryFinish'
 GROUP BY minute
 ORDER BY minute DESC;
 
--- 31 rows in set. Elapsed: 0.016 sec. Processed 271.88 thousand rows, 1.45 MB (16.99 million rows/s., 90.48 MB/s.)
--- Peak memory usage: 5.31 MiB.
--- ВАЖНО: ft_queries получился 0 на всех строках, хотя запросов
--- к financial_transactions за эти 30 минут были десятки. has(tables, 'financial_transactions')
--- ищет точное совпадение строки, а в system.query_log таблица записана
--- с префиксом БД — 'test.financial_transactions'. Рабочий вариант:
--- countIf(hasAny(tables, ['test.financial_transactions'])) или
--- countIf(arrayExists(t -> t LIKE '%financial_transactions%', tables)) — как в 2.6.
+-- 31 rows in set. Elapsed: 0.016 sec. Processed 272.38 thousand rows, 1.48 MB (17.02 million rows/s., 92.20 MB/s.)
+-- Peak memory usage: 4.49 MiB.
+-- hasAny() ищет точное совпадение строки, а в system.query_log таблица
+-- записана с префиксом БД — используйте полное имя 'test.financial_transactions'
+-- (или свою схему), иначе ft_queries всегда будет 0.
 ```
 
 ```sql
@@ -2094,7 +2075,7 @@ LIMIT 20;
 SELECT
     toStartOfMinute(query_start_time)                   AS minute,
     count()                                             AS queries_started,
-    countIf(hasAny(tables, ['financial_transactions'])) AS on_main_table,
+    countIf(hasAny(tables, ['test.financial_transactions'])) AS on_main_table,
     -- Запросы с подзапросами обычно длиннее и тяжелее
     countIf(query_duration_ms > 2000)                   AS heavy_queries,
     countIf(query_duration_ms <= 500)                   AS fast_queries,
@@ -2106,14 +2087,11 @@ WHERE type = 'QueryFinish'
 GROUP BY minute
 ORDER BY minute DESC;
 
--- 121 rows in set. Elapsed: 0.011 sec. Processed 271.93 thousand rows, 1.82 MB (24.72 million rows/s., 165.51 MB/s.)
--- Peak memory usage: 4.39 MiB.
--- on_main_table снова везде 0 — та же причина, что и в предыдущем запросе
--- (hasAny ищет 'financial_transactions' без префикса БД, а в tables хранится
--- 'test.financial_transactions'). Полные 120+ строк в файл не переношу —
--- по минутам видна фоновая активность на инстансе за пределами этого
--- кукбука (устойчивые 7-60 запросов/мин ещё до начала прогона примеров,
--- т.к. это общий шэренный managed-инстанс).
+-- 121 rows in set. Elapsed: 0.013 sec. Processed 272.42 thousand rows, 1.84 MB (20.96 million rows/s., 141.25 MB/s.)
+-- Peak memory usage: 4.41 MiB.
+-- Полные 120+ строк в файл не переношу — по минутам видна фоновая активность
+-- на инстансе за пределами этого кукбука (устойчивые 7-60 запросов/мин ещё
+-- до начала прогона примеров, т.к. это общий шэренный managed-инстанс).
 ```
 
 ```sql
@@ -2139,3 +2117,132 @@ WHERE event_time >= now() - INTERVAL 10 MINUTE
 ORDER BY event_time DESC, metric ASC
 LIMIT 10;
 ```
+
+---
+
+## 8. Использование таблиц и витрин в Datalens
+
+> Раздел написан по документации DataLens (<https://yandex.cloud/ru/docs/datalens/>).
+> В отличие от остальных разделов кукбука шаги в интерфейсе DataLens (создание
+> подключения, датасета, вычисляемого поля, чарта, включение параметризации)
+> руками не прогонялись — терминология и порядок экранов взяты из документации
+> и их стоит перепроверить в актуальном интерфейсе. SQL-часть 8.2
+> (представление и его вызов с параметрами) реально выполнена на базе `test`
+> — результат см. ниже.
+
+В качестве сквозного примера возьмём не саму таблицу `financial_transactions`,
+а представление `financial_transactions_analytics` из 5.1 — то, в котором уже
+посчитаны оконные функции (`amount_rank_in_segment`, `risk_percentile_in_country`
+и т.д.). Идея та же, что и в разделе 5: BI получает уже готовые колонки и не
+должен ничего досчитывать сам.
+
+### 8.1 Практика: датасет и чарт на представлении с оконными функциями
+
+**1. Подключение.** Если подключение к этому ClickHouse в DataLens ещё не
+создано — **Подключения → Создать подключение → ClickHouse®**. Для
+Managed Service указываются хост, порт HTTP-интерфейса, пользователь и
+пароль; для BI имеет смысл заводить отдельного пользователя с доступом
+только на чтение (см. 0.1). Уровень доступа SQL-запросов — «SQL на чтение».
+После проверки соединения — **Создать подключение**.
+
+**2. Создание датасета.** На странице подключения — **Создать датасет**.
+В списке таблиц источника выбираем не `financial_transactions`, а
+`financial_transactions_analytics` — представления ClickHouse видны в этом
+списке наравне с обычными таблицами, отдельно выбирать «режим SQL» не
+требуется. Перетаскиваем таблицу на рабочую область, переходим на вкладку
+**Поля**, сохраняем датасет с названием.
+
+**3. Вычисляемое поле.** На вкладке **Поля** — **Добавить поле**. Пример,
+завязанный на уже посчитанные в представлении оконные функции — метка
+риск-сегмента по перцентилю `risk_percentile_in_country`:
+
+```
+IF([risk_percentile_in_country] > 0.9, 'Высокий риск (топ 10%)',
+   IF([risk_percentile_in_country] > 0.5, 'Средний риск', 'Низкий риск'))
+```
+
+Называем поле, например, `Риск-сегмент`, и создаём.
+
+**4. Чарт.** На странице датасета — **Создать чарт**. Раскладка для
+примера: `merchant_category` — в **Измерения** (по оси X), `Риск-сегмент` —
+в **Измерения** как разбивку (легенда/цвет), количество транзакций
+(`count()` по `transaction_id`) — в **Показатели** (ось Y). DataLens при
+этом просто группирует и считает `count()` — сам перцентиль он не считает
+ни разу, вся тяжёлая часть уже отработала в ClickHouse при обращении к
+представлению.
+
+### 8.2 Задел: параметры датасета и параметризированные представления в БД
+
+DataLens умеет передавать значения параметров датасета в SQL-подзапрос
+источника через плейсхолдер `{{имя_параметра}}` — но, по документации, это
+работает только когда датасет описан произвольным SQL-запросом, а не
+выбором таблицы из списка (как в 8.1). Порядок в общих чертах:
+
+1. В датасете включить параметризацию, на вкладке **Параметры** добавить
+   параметр (название, тип, значение по умолчанию), включить для него
+   **Разрешить использовать в настройке источника**.
+2. В SQL-запросе источника подставить `{{имя_параметра}}` — например,
+   в `WHERE` или, как в этом кукбуке, в качестве значения параметра
+   параметризированного представления ClickHouse (в самом ClickHouse это
+   отдельная сущность: `CREATE VIEW ... AS SELECT ... WHERE col = {p:Type}`,
+   вызывается как `view_name(p = значение)`).
+
+Вариант такого представления над `financial_transactions_analytics` — вывод
+топа сегмента по стране с фильтром по минимальному риск-перцентилю,
+задаваемому параметром:
+
+```sql
+CREATE VIEW financial_transactions_top_by_country AS
+SELECT
+    transaction_id,
+    account_id,
+    merchant_category,
+    country,
+    transaction_date,
+    amount,
+    risk_score,
+    amount_rank_in_segment,
+    risk_percentile_in_country
+FROM financial_transactions_analytics
+WHERE country = {country:String}
+  AND risk_percentile_in_country >= {min_risk_percentile:Float64}
+ORDER BY amount_rank_in_segment;
+```
+
+Проверка из `clickhouse-client`:
+
+```sql
+SELECT count()
+FROM financial_transactions_top_by_country(country = 'US', min_risk_percentile = 0.9);
+
+-- 1 rows in set. Elapsed: 3.662 sec. Processed 50.00 million rows, 700.02 MB (13.65 million rows/s., 191.16 MB/s.)
+-- Peak memory usage: 545.29 MiB.
+```
+
+ВАЖНО: представление реально проверено на базе `test`, и даже с фильтром по
+`country` и `min_risk_percentile` ClickHouse читает и считает оконные функции
+по ВСЕЙ `financial_transactions_analytics` (50 млн строк, 3.7 сек) — ровно то
+предупреждение из 5.2: `WHERE` поверх представления с окнами применяется уже
+после того, как окна посчитаны по всей партиции. Для параметров, задающих
+узкий срез, разумнее не накручивать параметризацию поверх такого
+представления как есть, а выносить фильтр по параметру внутрь, до
+`PARTITION BY` — например, отдельным CTE/подзапросом по `financial_transactions`
+с `WHERE country = {country:String}`, и уже над ним считать оконные функции.
+
+В датасете DataLens источник тогда выглядит так (кавычки для `country`
+нужны явно — `{{...}}` в DataLens это текстовая подстановка, а не
+параметр с типом):
+
+```sql
+SELECT *
+FROM financial_transactions_top_by_country(
+    country = '{{country_param}}',
+    min_risk_percentile = {{min_risk_percentile_param}}
+);
+```
+
+Это именно задел: сама схема рабочая, но конкретные шаги мастера датасета
+для SQL-источника, валидацию параметров (регулярные выражения, о которых
+пишет документация DataLens) и поведение при пустом/некорректном значении
+параметра нужно проверять в интерфейсе отдельно, прежде чем выносить в
+продакшн-дашборд.
