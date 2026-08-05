@@ -75,6 +75,9 @@ ClickHouse — одна из лучших реализаций этого под
 
 ## 0. Развернуть ClickHouse
 
+Если у вас уже есть установленный ClickHouse версии не ранее 26.3.16, доступный для 
+тестовых операций с параметрами не менее 8CPU/32RAM, переходите к пункту 0.3.
+
 ### 0.1 Managed Service for ClickHouse
 
 Подходит, если нет навыков самостоятельного развёртывания и администрирования
@@ -388,6 +391,9 @@ WHERE merchant_category = 'Travel' -- проверьте наличие комб
   AND country = 'FR'               -- отдельным запросом
 GROUP BY transaction_date
 ORDER BY transaction_date;
+-- Ориентировочные параметры выполнения в clickhouse-client
+-- 73 rows in set. Elapsed: 0.066 sec. Processed 2.75 million rows, 79.07 MB (41.33 million rows/s., 1.19 GB/s.)
+Peak memory usage: 19.03 MiB.
 
 -- Запрос 2: фильтр только по payment_method — не входит в PRIMARY KEY/ORDER BY,
 -- поэтому полный скан партиций (демонстрация неэффективного случая)
@@ -399,6 +405,9 @@ FROM financial_transactions
 WHERE payment_method = 'card'
 GROUP BY merchant_category
 ORDER BY total_amount DESC;
+
+-- 5 rows in set. Elapsed: 0.143 sec. Processed 50.00 million rows, 306.51 MB (350.59 million rows/s., 2.15 GB/s.)
+Peak memory usage: 824.40 KiB.
 ```
 
 Сравнивать по строке итога в clickhouse-client (время, прочитано строк) либо во
@@ -547,6 +556,9 @@ SELECT
 FROM financial_transactions
 GROUP BY merchant_category, country
 ORDER BY revenue DESC;
+
+-- 30 rows in set. Elapsed: 0.017 sec. Processed 54.10 thousand rows, 3.61 MB (3.12 million rows/s., 208.32 MB/s.)
+Peak memory usage: 937.27 KiB.
 
 -- Проверка
 EXPLAIN indexes = 1
