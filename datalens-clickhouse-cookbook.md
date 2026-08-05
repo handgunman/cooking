@@ -1,0 +1,1925 @@
+# Кукбук: DataLens + ClickHouse
+
+Черновик. Цель — не обучение работе с ClickHouse, а короткая дорожка,
+позволяющая обойти типовые ошибки при использовании ClickHouse как источника
+данных для DataLens.
+
+Все примеры выполняются на одном сквозном наборе данных: таблица
+`financial_transactions` на 50 млн строк.
+
+## Оглавление
+
+- 00. Почему под BI берут колоночную СУБД
+- 0. Развернуть ClickHouse
+  - 0.1 Managed Service for ClickHouse
+  - 0.2 Своя установка
+  - 0.3 Версии и обновления
+- 1. Проектирование таблиц
+  - 1.1 Где выполнять работы
+  - 1.2 Широкая денормализованная таблица
+  - 1.3 ORDER BY и PRIMARY KEY
+  - 1.4 Дата в ключе сортировки
+  - 1.5 Партиционирование
+  - 1.6 Практика: создание таблицы и наполнение
+  - 1.7 Практика: два запроса для сравнения
+- 2. Проекции
+  - 2.1 Что бывает
+  - 2.2 Ограничение: проекция живёт внутри парта
+  - 2.3 DISTINCT и селекторы DataLens
+  - 2.4 Нюансы движков
+  - 2.5 Практика: четыре проекции
+  - 2.6 Практика: проверка использования
+- 3. Скип-индексы
+  - 3.1 Когда работают
+  - 3.2 Практика: minmax индексы для числовых колонок
+  - 3.3 Практика: bloom filter и OR по двум колонкам
+- 4. Не страшный JOIN и словари
+  - 4.1 Справочник и «внешний ключ»
+  - 4.2 Словарь — более эффективный метод присоединения семантики
+  - 4.3 JOIN против dictGet
+  - 4.4 Практика: замеры
+- 5. Представления и оконные функции
+  - 5.1 Представление
+  - 5.2 Стоимость окон
+  - 5.3 Запрос с одной оконной функцией
+  - 5.4 Селекторы поверх представления
+- 6. Материализованные представления
+  - 6.1 Инкрементальный MV — триггер на вставку
+  - 6.2 AggregatingMergeTree и состояния агрегатов
+  - 6.3 Refreshable MV: REPLACE и APPEND
+  - 6.4 Что выбирать
+- 7. Мониторинг BI-нагрузки
+
+---
+
+## 00. Почему под BI берут колоночную СУБД
+
+- Профиль нагрузки BI — OLAP: агрегации по сотням миллионов строк, при этом в
+  запросе участвуют единицы колонок из десятков имеющихся. Так устроен почти
+  любой график: одно-два измерения, одна-две меры.
+- Строковая СУБД читает строку целиком, включая ненужные запросу колонки.
+  Колоночная читает только затронутые колонки — объём чтения падает
+  пропорционально доле используемых полей.
+- В пределах колонки данные однородны, поэтому общие алгоритмы сжатия (LZ4,
+  ZSTD) дают заметно лучший результат, чем на строковом представлении, а
+  специализированные кодеки (Delta, DoubleDelta, Gorilla, T64) дожимают
+  монотонные ряды. Эффект двойной: экономия диска и ускорение чтения.
+- Обработка идёт блоками (векторизация), с эффективным использованием кэшей CPU.
+- Итог: на одинаковых ресурсах разница со строковой СУБД измеряется не
+  процентами, а кратами.
+
+ClickHouse — одна из лучших реализаций этого подхода: open source, линейное
+масштабирование, нативный коннектор в DataLens.
+
+---
+
+## 0. Развернуть ClickHouse
+
+### 0.1 Managed Service for ClickHouse
+
+Подходит, если нет навыков самостоятельного развёртывания и администрирования
+либо самой цели держать свою инфраструктуру. Глубоко вникать в настройки не
+потребуется: кластер разворачивается уже с конфигурацией, подходящей для
+большинства задач. Значения по умолчанию без причины не менять.
+
+Второй аргумент — гибкость ресурсов. Класс хоста и объём диска меняются в
+несколько кликов, поэтому можно начать пилотный проект на базовых ресурсах и
+расширяться по мере роста проекта и объёма данных, а не закладывать
+инфраструктуру «на вырост» сразу.
+
+Порядок действий в консоли Yandex Cloud:
+
+1. Managed Service for ClickHouse → **Создать кластер**.
+2. **Версия** — см. 0.3.
+3. **Класс хоста** — минимальный рабочий вариант по рекомендациям разработчиков
+   ClickHouse: 8 vCPU / 32 GB RAM.
+4. **Хранилище** — от пары сотен ГБ. Помимо запаса под данные и мержи, в
+   Managed Services размер диска напрямую связан со скоростью чтения:
+   производительность сетевого диска растёт вместе с объёмом.
+5. **Хосты** — один хост для пилота и типовых задач. При требовании повышенной
+   отказоустойчивости — кластерная конфигурация из нескольких хостов с
+   ClickHouse Keeper.
+6. **База данных и пользователь** — создать на этом же шаге. Для BI завести
+   отдельного пользователя, только на чтение нужной БД.
+7. **Настройки доступа** — включить доступ из DataLens и доступ через
+   WebSQL / консоль управления.
+
+### 0.2 Своя установка
+
+Если ClickHouse ставится самостоятельно — официальный репозиторий (`apt`/`yum`)
+или официальный docker-образ. Дальше в кукбуке разницы нет: всё описанное
+одинаково работает и в Managed Service, и на своей инсталляции.
+
+### 0.3 Версии и обновления
+
+Ставьте свежие версии и следите за обновлениями. Релизы выходят ежемесячно, и
+заметная доля изменений — это оптимизации именно тех сценариев, которые
+генерирует BI: агрегации, JOIN, DISTINCT, фильтрация по ключу сортировки,
+работа проекций. Разрыв в год-полтора по версиям означает, что часть проблем с
+производительностью вы решаете руками там, где новая версия решает их сама.
+
+Но «свежая» не значит «только что вышедшая»:
+
+- Брать линию LTS, с релиза которой прошло 2-3 месяца — за это время
+  устраняются основные проблемы релиза. То есть не 26.3.1, а 26.3.17 на текущий
+  момент.
+- Продуктив — плановое обновление на следующую LTS по той же логике.
+- Перед обновлением просматривать чейнджлог, в первую очередь раздел backward
+  incompatible changes:
+  <https://github.com/ClickHouse/ClickHouse/tree/master/docs/changelogs>
+
+---
+
+## 1. Проектирование таблиц
+
+### 1.1 Где выполнять работы
+
+Проектирование и проверку выполнять не в BI-интерфейсе, а там, где сразу видна
+цена запроса:
+
+- **clickhouse-client** — после каждого запроса выводит время выполнения,
+  количество прочитанных строк и объём. Основной рабочий инструмент.
+- **WebSQL в консоли Yandex Cloud** — те же данные доступны во вкладке
+  метаданных.
+
+Дашборд как измерительный прибор не годится: в нём не видно, сколько строк
+реально прочитано и какой план был выбран.
+
+### 1.2 Широкая денормализованная таблица
+
+Основа подхода — денормализованные широкие таблицы, содержащие и колонки
+семантики (справочные данные, измерения), и множество колонок показателей.
+
+Причина: сильная сторона ClickHouse — сканирование и агрегация одной таблицы, а
+JOIN остаётся относительно дорогой операцией. При этом BI генерирует SQL сам, и
+вручную оптимизировать его план возможности нет.
+
+Разумные пределы:
+
+- Избыточное количество семантических колонок усложняет оптимизацию структуры:
+  сложнее подобрать `ORDER BY`, обслуживающий все сценарии.
+- Меняющаяся семантика справочных данных иногда не позволяет внести их в широкую
+  таблицу: записанные в факт значения окажутся зафиксированными на момент
+  вставки. Если справочник переименовывают, переклассифицируют или
+  реорганизуют, а отчётность должна показывать актуальное состояние, семантику
+  оставляют снаружи — в справочной таблице или словаре (раздел 4).
+- Массивы и JSON бывают удобны (переменный набор атрибутов, параметры событий,
+  теги), но обходятся дороже при выборке и требуют в DataLens дополнительных
+  вычисляемых полей на распаковку. Точечно, а не как способ не проектировать
+  схему.
+- Дублирование справочных значений в широкой таблице обычно не проблема:
+  низкокардинальные строки хорошо сжимаются (колонки с менее чем 10 000
+  уникальных значений — хорошие кандидаты для LowCardinality).
+
+### 1.3 ORDER BY и PRIMARY KEY
+
+В ClickHouse нет первичных и внешних ключей в привычном смысле, нет индексов
+вроде b-tree, нет ограничений целостности. Первичный ключ ничего не гарантирует
+по уникальности.
+
+Основа — семейство движков MergeTree, а его краеугольный камень — сортировка
+`ORDER BY`. Она определяет, как данные физически хранятся на диске, и то, как
+система оптимизирует их выборку: отсечение засечек при фильтрации,
+эффективность сжатия соседних значений, возможность агрегации без пересортировки.
+
+`PRIMARY KEY` — подмножество-префикс `ORDER BY`: та часть ключа сортировки, по
+которой строится разреженный индекс, хранимый в оперативной памяти. Разреженный
+— потому что содержит по одной записи на гранулу (по умолчанию 8192 строки).
+Разделять `PRIMARY KEY` и `ORDER BY` имеет смысл, когда сортировать нужно
+глубже, чем индексировать: хвостовые колонки улучшают сжатие и локальность, но
+не раздувают индекс в памяти.
+
+Базовый вариант выбора порядка — поля измерений по возрастанию кардинальности:
+Страна → Город → Улица → Дом. Получается вложенность, как в структуре папок.
+
+Но отталкиваться нужно от сценариев использования, а не от кардинальности как
+таковой:
+
+- Если поле очень редко участвует в условиях отбора, его размещение впереди даёт
+  ненужные накладные расходы. Если выборка всегда строится по названию Города,
+  нет смысла проверять его наличие в каждой Стране.
+- Поля можно исключать из `ORDER BY` совсем, если они не участвуют ни в
+  фильтрах, ни в группировках.
+- Поля можно менять местами вопреки кардинальности, если этого требует типовой
+  фильтр.
+- Предпочитайте колонки, которые исключают наибольший процент строк при
+  фильтрации, а не просто имеют наименьшую кардинальность.
+- Ключ держать коротким: 3-5 колонок. Каждая следующая всё меньше влияет на
+  отсечение и всё больше — на стоимость мержей.
+- Один `ORDER BY` не обслужит все сценарии. Если сценарии конфликтуют — это
+  повод не на компромисс, а на проекцию (раздел 2).
+
+В процессе жизненного цикла BI-системы подход к организации сортировок и прочих
+конструкций оптимизации выборки стоит пересматривать вслед за меняющимися
+сценариями использования.
+
+### 1.4 Дата в ключе сортировки
+
+ Большинстве случаев аналитическая обработка связана с интервалами дат и времени и поля с ними - очевидный кандидат в ORDER BY.
+
+Типовая ошибка.
+
+- Поле типа `Date` на первой позиции оправдано только если на каждую дату
+  приходятся миллионы записей с разными значениями других измерений.
+- Если это дата со временем, первая позиция может стать фатальной.
+  Кардинальность близка к числу строк, каждая гранула получает уникальный
+  диапазон, и все последующие колонки ключа перестают работать на отсечение.
+  Сжатие остальных колонок тоже ухудшается.
+- Разумное решение — помещать в начало не саму дату, а её огрубление:
+  `dateTrunc('month', ...)`, `toStartOfWeek(...)`, `toYYYYMM(...)`. Точное время
+  остаётся отдельной колонкой и может стоять в хвосте ключа.
+
+Исключения, когда таймстемп или уникальный идентификатор на первом месте
+оправдан:
+
+- временные ряды — запрос по интервалу времени и есть основной сценарий;
+- быстрый поиск по конкретному id — точечная выборка, а не аналитика по срезам.
+
+В BI такие случаи встречаются, но они не типовые. Не проектируйте под них
+таблицу, которая обслуживает дашборды.
+
+### 1.5 Партиционирование
+
+Партиционирование давно перестало быть инструментом оптимизации выборок. Это
+часть механизма управления данными: перенос и отсоединение партиций, удаление
+старых данных, обработка по партициям, бэкапы.
+
+Для ускорения запросов `toYYYYMM(dt)` в начале ключа сортировки, как правило,
+полезнее, чем такое же выражение в `PARTITION BY`. Логика та же, что со
+странами: партиция — дополнительный верхний уровень, по которому система
+вынуждена ходить. Каждая партиция хранится отдельно, и запрос, охватывающий
+несколько периодов, заглядывает в каждую из них. При мелком партиционировании
+получается множество мелких кусков, лишние накладные расходы на планирование и
+мержи — и никакого выигрыша, которого не дал бы `ORDER BY`. При этом, вполне 
+допустимо сделать партицию по полю даты с округлением и не помещать это поле в 
+`ORDER BY`.
+
+Практика: партиций немного и они крупные. По месяцам — норма; по дням — только
+если действительно нужно посуточно перекладывать данные.
+
+### 1.6 Практика: создание таблицы и наполнение
+
+```sql
+-- ============================================================
+-- 1. СОЗДАНИЕ ТАБЛИЦЫ
+-- ============================================================
+-- PRIMARY KEY — компактный индекс в RAM (только 2 колонки)
+-- ORDER BY   — физическая сортировка на диске (4 колонки)
+-- PRIMARY KEY должен быть префиксом ORDER BY
+-- Порядок ключей выбран по логике запросов, НЕ по кардинальности:
+--   merchant_category (~10)  — самый частый фильтр в аналитике
+--   country           (~15)  — второй по частоте фильтр
+--   month             (~36)  — диапазонные фильтры по периоду
+--   account_id        (~1M)  — точечные запросы по клиенту
+-- payment_method и status (кардинальность 4) НЕ стоят первыми —
+-- фильтр WHERE payment_method = 'card' захватывает ~25% строк
+-- и почти не помогает сократить объём чтения, тогда как
+-- merchant_category = 'Travel' сразу отсекает ~90% данных.
+-- Правило: предпочитайте колонки которые исключают наибольший
+-- процент строк при фильтрации, а не просто имеют наименьшую кардинальность.
+
+CREATE TABLE financial_transactions
+(
+    -- Измерения (dimensions)
+    transaction_id    UInt64,
+    account_id        UInt32,                 -- ~1M уникальных (высокая кардинальность)
+    merchant_category LowCardinality(String), -- ~10 категорий  (низкая кардинальность)
+    payment_method    Enum8(
+                          'card'     = 1,
+                          'transfer' = 2,
+                          'cash'     = 3,
+                          'crypto'   = 4
+                      ),                      -- 4 значения (очень низкая кардинальность)
+    country           LowCardinality(String), -- ~15 стран      (средняя кардинальность)
+    currency          LowCardinality(String), -- ~7 валют       (низкая кардинальность)
+    transaction_date  Date,                   -- ~1095 дней     (средняя кардинальность)
+    status            Enum8(
+                          'completed' = 1,
+                          'pending'   = 2,
+                          'failed'    = 3,
+                          'refunded'  = 4
+                      ),                      -- 4 значения (очень низкая кардинальность)
+
+    -- Показатели (metrics)
+    amount            Decimal(18, 2),
+    fee               Decimal(10, 4),
+    exchange_rate     Float32,
+    cashback_amount   Decimal(10, 4),
+    risk_score        UInt8                   -- 0–100
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(transaction_date)
+PRIMARY KEY (merchant_category, country)
+ORDER BY (merchant_category, country, dateTrunc('month', transaction_date), account_id);
+```
+
+```sql
+-- ============================================================
+-- 2. ЗАПОЛНЕНИЕ ДАННЫМИ
+-- ============================================================
+INSERT INTO financial_transactions
+SELECT
+    rowNumberInAllBlocks() + 1                                AS transaction_id,
+    toUInt32(rand() % 1000000)                                AS account_id,
+    arrayElement(
+        ['Retail', 'Food & Beverage', 'Travel', 'Healthcare',
+         'Entertainment', 'Utilities', 'E-commerce', 'Finance',
+         'Education', 'Automotive'],
+        (rand() % 10) + 1
+    )                                                         AS merchant_category,
+    arrayElement(
+        ['card', 'transfer', 'cash', 'crypto'],
+        (rand() % 4) + 1
+    )                                                         AS payment_method,
+    arrayElement(
+        ['US', 'DE', 'FR', 'GB', 'JP', 'CN', 'BR', 'IN', 'RU', 'AU',
+         'CA', 'MX', 'KR', 'IT', 'ES'],
+        (rand() % 15) + 1
+    )                                                         AS country,
+    arrayElement(
+        ['USD', 'EUR', 'GBP', 'JPY', 'CNY', 'RUB', 'BRL'],
+        (rand() % 7) + 1
+    )                                                         AS currency,
+    today() - 1095 + toInt32(rand() % 1095)                   AS transaction_date,
+    arrayElement(
+        ['completed', 'pending', 'failed', 'refunded'],
+        (rand() % 4) + 1
+    )                                                         AS status,
+    toDecimal64(10 + (rand() % 9999000) / 100.0, 2)           AS amount,
+    toDecimal64((rand() % 500) / 10000.0, 4)                  AS fee,
+    toFloat32(0.5 + (rand() % 200) / 100.0)                   AS exchange_rate,
+    toDecimal64((rand() % 200) / 10000.0, 4)                  AS cashback_amount,
+    toUInt8(rand() % 101)                                     AS risk_score
+FROM numbers(50000000);
+```
+
+```sql
+-- Конкретные значения кардинальности можно получить запросом
+SELECT
+    uniq(transaction_id)    AS card_transaction_id,
+    uniq(account_id)        AS card_account_id,
+    uniq(merchant_category) AS card_merchant_category,
+    uniq(payment_method)    AS card_payment_method,
+    uniq(country)           AS card_country,
+    uniq(currency)          AS card_currency,
+    uniq(transaction_date)  AS card_transaction_date,
+    uniq(status)            AS card_status
+FROM financial_transactions;
+```
+
+### 1.7 Практика: два запроса для сравнения
+
+```sql
+-- ============================================================
+-- 3. ПРИМЕРЫ ЗАПРОСОВ К БАЗОВОЙ ТАБЛИЦЕ
+-- ============================================================
+
+-- Запрос 1: фильтр по merchant_category + country — первые два ключа PRIMARY KEY,
+-- ClickHouse эффективно пропускает ненужные гранулы
+SELECT
+    transaction_date,
+    count()              AS tx_count,
+    sum(amount)          AS total_amount,
+    avg(fee)             AS avg_fee,
+    avg(risk_score)      AS avg_risk,
+    sum(cashback_amount) AS total_cashback
+FROM financial_transactions
+WHERE merchant_category = 'Travel' -- проверьте наличие комбинации в синтетических данных
+  AND country = 'FR'               -- отдельным запросом
+GROUP BY transaction_date
+ORDER BY transaction_date;
+
+-- Запрос 2: фильтр только по payment_method — не входит в PRIMARY KEY/ORDER BY,
+-- поэтому полный скан партиций (демонстрация неэффективного случая)
+SELECT
+    merchant_category,
+    count()        AS tx_count,
+    sum(amount)    AS total_amount
+FROM financial_transactions
+WHERE payment_method = 'card'
+GROUP BY merchant_category
+ORDER BY total_amount DESC;
+```
+
+Сравнивать по строке итога в clickhouse-client (время, прочитано строк) либо во
+вкладке метаданных WebSQL.
+
+---
+
+## 2. Проекции
+
+Проекция — дополнительный скрытый набор данных внутри той же таблицы,
+поддерживаемый автоматически при вставке. Фактически это скрытая таблица со
+своим порядком строк, своим первичным индексом и, при необходимости,
+инкрементально пересчитываемыми агрегатами.
+
+Проекции особенно удобны в связке с BI-инструментами: запрос всегда адресован
+одной таблице, а ClickHouse сам выбирает оптимальный layout. В большинстве
+BI-инструментов смена целевой таблицы нетривиальна — даже там, где это
+технически возможно (например, через параметры датасета в DataLens), это влечёт
+ограничения: таблицы должны поддерживаться в полном соответствии по составу
+полей, что создаёт операционную нагрузку.
+
+Обратная сторона: отдельные таблицы-агрегаты (через материализованные
+представления, раздел 6) дают гарантированное использование нужного layout — запрос явно
+адресован конкретной таблице, и оптимизатор не принимает решение за вас.
+Проекции же используются по усмотрению оптимизатора, и выбор базовой таблицы
+вместо проекции — ситуация не такая уж редкая. Поэтому проверка обязательна
+(2.6).
+
+### 2.1 Что бывает
+
+- **Альтернативная сортировка** (normal). Копия выбранных колонок в другом
+  порядке сортировки со своим первичным индексом. Внутренний движок MergeTree
+  (нет `GROUP BY`, только `ORDER BY`).
+- **Предагрегация** (aggregate). Результаты `GROUP BY`, подготовленные заранее.
+  Внутренний движок AggregatingMergeTree — назначается автоматически, если в
+  проекции есть `GROUP BY`.
+- **Индексоподобная** (`_part_offset`, с 25.5). Хранится только ключ сортировки
+  плюс указатель на позицию строки в базовом парте; проекция работает как
+  вторичный индекс, данные читаются из базовой таблицы. Режимы можно смешивать.
+  С 25.6 несколько таких проекций применяются к одному запросу с несколькими
+  фильтрами. С 26.1 доступен компактный синтаксис
+  `PROJECTION by_town INDEX town TYPE basic`.
+
+### 2.2 Ограничение: проекция живёт внутри парта
+
+Проекция хранится внутри тех же партов основной таблицы. Отсюда следствие: её
+сортировка и её индекс локальны для парта, и в лучшем случае читается по одному
+диапазону на каждый парт, где есть подходящие строки.
+
+- Работает, когда значения ключа проекции сгруппированы: конкретное значение
+  встречается не во всех партах, а в немногих. Такая группировка возникает из
+  корреляции с порядком вставки (типично для дат и монотонных id) либо с
+  основной сортировкой.
+- Если ключ проекции распределён по партам равномерно и независимо от всего
+  остального, высокоселективный фильтр найдёт совпадения в каждом парте, и
+  накладные расходы съедят выигрыш. Особенно для `_part_offset`-варианта, где
+  после поиска нужно ещё сходить в базовую таблицу.
+- Мелкие партиции и много мелких партов бьют по проекциям сильнее, чем по
+  обычным запросам: стоимость умножается на число партов.
+
+### 2.3 DISTINCT и селекторы DataLens
+
+С 25.11 проекция с предагрегацией используется и для запросов с `DISTINCT`: если
+получение всех уникальных значений требует чтения меньшего числа строк из
+проекции, ClickHouse возьмёт её автоматически.
+
+Почему это важно именно в паре с DataLens: каждый селектор на дашборде — это
+отдельный запрос с `DISTINCT` по измерению. Селекторов обычно несколько, и они
+выполняются при каждом открытии дашборда, до любых действий пользователя. На
+таблице в сотни миллионов строк это несколько сканирований на каждое открытие,
+и в глазах пользователя выглядит как «дашборд грузится», хотя сами графики могут
+быть быстрыми. Особенно заметно на дашбордах с обилием селекторов, построенных
+на представлениях.
+
+Проекция с `GROUP BY` по набору измерений, используемых в селекторах, — один из
+самых дешёвых способов улучшить восприятие скорости дашборда. Проверка — в 5.4.
+
+### 2.4 Нюансы движков
+
+MergeTree — семейство, и в движках с заменой и агрегацией использование
+проекций имеет особенности:
+
+- С 24.8 настройка `deduplicate_merge_projection_mode` определяет поведение
+  проекций при мержах на ReplacingMergeTree, CollapsingMergeTree,
+  VersionedCollapsingMergeTree и при `OPTIMIZE DEDUPLICATE`. Значения:
+  `throw` (по умолчанию), `drop`, `rebuild`, `ignore`.
+- При режиме по умолчанию добавление проекции на таком движке отклоняется с
+  требованием выбрать `drop` или `rebuild` явно.
+- Причина осторожности — расхождение результатов: агрегат в проекции может быть
+  посчитан по строкам до дедупликации, и тогда число по проекции и по таблице
+  отличаются.
+- По умолчанию лёгкие удаления на таблицах с проекциями завершаются ошибкой;
+  поведение настраивается через `lightweight_mutation_projection_mode` (с 24.7):
+  `throw`, `drop`, `rebuild`.
+
+Практический вывод: на движках с заменой и агрегацией проекции применимы, но
+режим нужно выбрать осознанно и проверить совпадение чисел с базовой таблицей
+до того, как результат попадёт на дашборд. `rebuild` при потоке обновлений может
+оказаться дорогим.
+
+### 2.5 Практика: четыре проекции
+
+Материализация не ретроактивна: добавление проекции действует только на новые
+вставки, для существующих данных нужен `MATERIALIZE PROJECTION` (тяжёлая
+операция, прогресс — в `system.mutations`).
+
+```sql
+-- ------------------------------------------------------------
+-- Проекция 1: агрегаты по категории и стране
+-- Ускоряет: COUNT, SUM, AVG по измерениям merchant_category/country
+-- Внутренний движок: AggregatingMergeTree (автоматически, т.к. есть GROUP BY)
+-- ------------------------------------------------------------
+ALTER TABLE financial_transactions
+ADD PROJECTION prj_agg_by_category_country
+(
+    SELECT
+        merchant_category,
+        country,
+        currency,
+        status,
+        dateTrunc('month', transaction_date) AS month,
+        count()                              AS tx_count,
+        sum(amount)                          AS total_amount,
+        avg(amount)                          AS avg_amount,
+        sum(fee)                             AS total_fee,
+        sum(cashback_amount)                 AS total_cashback,
+        avg(risk_score)                      AS avg_risk_score
+    GROUP BY
+        merchant_category,
+        country,
+        currency,
+        status,
+        month
+);
+
+ALTER TABLE financial_transactions
+    MATERIALIZE PROJECTION prj_agg_by_category_country;
+
+-- Пример запроса использующего проекцию
+SELECT
+    merchant_category,
+    country,
+    count()            AS total_transactions,
+    sum(amount)        AS revenue,
+    avg(risk_score)    AS risk
+FROM financial_transactions
+GROUP BY merchant_category, country
+ORDER BY revenue DESC;
+
+-- Проверка
+EXPLAIN indexes = 1
+SELECT
+    merchant_category,
+    country,
+    count()        AS total_transactions,
+    sum(amount)    AS revenue,
+    avg(risk_score) AS risk
+FROM financial_transactions
+GROUP BY merchant_category, country
+ORDER BY revenue DESC;
+```
+
+```sql
+-- ------------------------------------------------------------
+-- Проекция 2: агрегаты по аккаунту
+-- Ускоряет: профиль клиента, история по account_id
+-- Внутренний движок: AggregatingMergeTree (автоматически, т.к. есть GROUP BY)
+-- ------------------------------------------------------------
+ALTER TABLE financial_transactions
+ADD PROJECTION prj_agg_by_account
+(
+    SELECT
+        account_id,
+        merchant_category,
+        payment_method,
+        dateTrunc('month', transaction_date) AS month,
+        count()                              AS tx_count,
+        sum(amount)                          AS total_amount,
+        max(amount)                          AS max_amount,
+        sum(cashback_amount)                 AS total_cashback,
+        avg(risk_score)                      AS avg_risk_score
+    GROUP BY
+        account_id,
+        merchant_category,
+        payment_method,
+        month
+);
+
+ALTER TABLE financial_transactions
+    MATERIALIZE PROJECTION prj_agg_by_account;
+
+-- Пример запроса использующего проекцию
+-- dateTrunc в GROUP BY — ClickHouse сопоставит с алиасом month в проекции
+SELECT
+    dateTrunc('month', transaction_date) AS month,
+    merchant_category,
+    count()                              AS transactions,
+    sum(amount)                          AS spent
+FROM financial_transactions
+WHERE account_id = 42345
+GROUP BY month, merchant_category
+ORDER BY month;
+```
+
+```sql
+-- ------------------------------------------------------------
+-- Проекция 3: иная сортировка для фрод-аналитики
+-- Ускоряет: ORDER BY risk_score, amount — альтернативный порядок чтения
+-- Внутренний движок: MergeTree (нет GROUP BY, только ORDER BY)
+-- ВНИМАНИЕ: SELECT * дублирует все данные таблицы на диске!
+-- ------------------------------------------------------------
+ALTER TABLE financial_transactions
+ADD PROJECTION prj_order_by_risk
+(
+    SELECT *
+    ORDER BY (risk_score, amount, transaction_date)
+);
+
+ALTER TABLE financial_transactions
+    MATERIALIZE PROJECTION prj_order_by_risk;
+
+-- Пример запроса использующего проекцию
+SELECT
+    transaction_id,
+    account_id,
+    country,
+    merchant_category,
+    amount,
+    risk_score
+FROM financial_transactions
+WHERE risk_score > 90
+  AND amount > 500
+ORDER BY risk_score DESC, amount DESC
+LIMIT 100;
+```
+
+Начиная с версии 25.5 доступны проекции-индексы (projection index): они хранят
+только ключ сортировки и виртуальную колонку `_part_offset`, по которой строки
+читаются из базовой таблицы. Компактный синтаксис `INDEX ... TYPE basic` из
+примера ниже доступен с версии 26.1.
+
+```sql
+-- ------------------------------------------------------------
+-- Проекция 4: lookup по transaction_id (точечный поиск)
+-- Ускоряет: WHERE transaction_id = ?
+-- Внутренний движок: projection index — хранит только _part_offset
+-- ПРЕИМУЩЕСТВО: минимальное потребление дискового пространства
+-- может быть использован при ORDER BY (toDate(created_at), transaction_id)
+-- при наличии корреляции между created_at и transaction_id
+-- ------------------------------------------------------------
+ALTER TABLE financial_transactions
+    ADD PROJECTION idx_by_transaction_id INDEX transaction_id TYPE basic;
+
+ALTER TABLE financial_transactions
+    MATERIALIZE PROJECTION idx_by_transaction_id;
+
+-- Пример запроса использующего проекцию
+SELECT
+    transaction_id,
+    account_id,
+    amount,
+    status,
+    transaction_date
+FROM financial_transactions
+WHERE transaction_id = 123456789;
+```
+
+### 2.6 Практика: проверка использования
+
+Проекции занимают место на диске и расходуют ресурсы при мержах. Не держите те,
+что не используются.
+
+```sql
+-- ============================================================
+-- 5. ПРОВЕРКА РАБОТЫ ПРОЕКЦИЙ
+-- ============================================================
+
+-- Метод 1: EXPLAIN — смотрим ReadFromMergeTree (имя проекции или имя таблицы)
+EXPLAIN indexes = 1
+SELECT
+    transaction_id,
+    account_id,
+    country,
+    merchant_category,
+    amount,
+    risk_score
+FROM financial_transactions
+WHERE risk_score > 90
+  AND amount > 5000
+ORDER BY risk_score DESC, amount DESC
+LIMIT 100;
+```
+
+```sql
+-- Метод 2: FORMAT Null + force_optimize_projection_name
+-- Если проекция НЕ используется — запрос упадёт с ошибкой
+-- Проверяем prj_order_by_risk
+SELECT
+    transaction_id,
+    account_id,
+    country,
+    merchant_category,
+    amount,
+    risk_score
+FROM financial_transactions
+WHERE risk_score > 90
+  AND amount > 5000
+ORDER BY risk_score DESC, amount DESC
+LIMIT 100
+FORMAT Null
+SETTINGS force_optimize_projection_name = 'prj_order_by_risk';
+
+-- Проверяем prj_agg_by_category_country
+SELECT
+    merchant_category,
+    country,
+    sum(tx_count)       AS total_transactions,
+    sum(total_amount)   AS revenue,
+    avg(avg_risk_score) AS risk
+FROM financial_transactions
+GROUP BY merchant_category, country
+ORDER BY revenue DESC
+FORMAT Null
+SETTINGS force_optimize_projection_name = 'prj_agg_by_category_country';
+-- Если проекция не используется — получим ошибку вида:
+-- Exception: Projection prj_agg_by_category_country is specified in setting
+-- force_optimize_projection_name, but it is not used.
+```
+
+```sql
+-- Метод 3: system.query_log — реальная статистика после выполнения
+SELECT
+    query,
+    projections,
+    formatReadableQuantity(read_rows) AS read_rows,
+    query_duration_ms
+FROM system.query_log
+WHERE type = 'QueryFinish'
+  AND arrayExists(t -> t LIKE '%financial_transactions%', tables)
+ORDER BY initial_query_start_time DESC
+LIMIT 10;
+```
+
+---
+
+## 3. Скип-индексы
+
+### 3.1 Когда работают
+
+Скип-индексы — дополнение к проекциям и сортировке, а не замена. Основная
+область применения: колонки невысокой кардинальности, с хорошей корреляцией с
+`ORDER BY` таблицы и неравномерным распределением значений. Тогда индекс быстро
+отсекает гранулы, где нужного значения заведомо нет.
+
+Если бы индексируемая колонка была случайной (без корреляции с `ORDER BY`),
+значения оказались бы размазаны по всем гранулам, и bloom filter почти не давал
+бы выигрыша.
+
+Частный, но интересный случай — фильтр `OR` по двум колонкам: найти транзакции,
+где аккаунт участвует в любой роли (отправитель ИЛИ получатель), аналог
+`credit_account OR debit_account`. Ключом такой запрос не закрывается.
+
+### 3.2 Практика: minmax индексы для числовых колонок
+Хорошие кандидаты:
+`transaction_id` — монотонно возрастающий UInt64. Minmax будет очень эффективен, так как значения естественно упорядочены внутри частей.
+
+Сомнительные и плохие кандидаты:
+`account_id` — высокая кардинальность (~1M), но значения внутри гранул будут перемешаны (последний элемент `ORDER BY`). Minmax даст слабую селективность — диапазоны min/max в каждой грануле будут широкими и перекрывающимися.
+
+`fee`, `cashback_amount`, `exchange_rate` — зависят от `amount` и `merchant_category`, корреляция с `ORDER BY` слабая. `Minmax` может помочь, но эффект непредсказуем без реального тестирования.
+`payment_method`, `status` — всего 4 значения. `Minmax` будет хранить min=1, max=4 почти в каждой грануле — индекс никогда ничего не отсечёт.
+https://clickhouse.com/docs/clickstack/managing/performance-tuning#when-to-add-skip-indexes
+
+```sql
+-- transaction_id — монотонно возрастает, minmax очень эффективен
+-- Особенно полезен для запросов вида WHERE transaction_id BETWEEN X AND Y
+ALTER TABLE financial_transactions
+    ADD INDEX idx_minmax_transaction_id transaction_id TYPE minmax GRANULARITY 1;
+
+-- Материализация индексов (обязательно после ADD INDEX!)
+ALTER TABLE financial_transactions MATERIALIZE INDEX idx_minmax_transaction_id;
+
+-- Проверяем что индекс реально отсекает гранулы
+EXPLAIN indexes = 1
+SELECT count(), sum(amount)
+FROM financial_transactions
+WHERE transaction_id = 97234;
+
+-- В выводе ищем секцию Skip:
+-- Parts: 36/109   <- чем меньше левое число, тем лучше работает индекс
+-- Granules: 2955/6146
+```
+Если индекс не используется, то, вероятно risk_score и amount не коррелируют с ключом сортировки. 
+
+### 3.3 Практика: bloom filter и OR по двум колонкам
+
+```sql
+-- ============================================================
+-- 6. BLOOM FILTER ИНДЕКСЫ ДЛЯ OR-ФИЛЬТРАЦИИ ПО ДВУМ КОЛОНКАМ
+-- ============================================================
+-- Паттерн: найти транзакции где аккаунт участвует в любой роли
+-- (отправитель ИЛИ получатель) — аналог credit_account OR debit_account
+
+-- Добавляем колонки
+ALTER TABLE financial_transactions
+    ADD COLUMN sender_account_id   UInt32 DEFAULT account_id,
+    ADD COLUMN receiver_account_id UInt32 DEFAULT toUInt32(rand() % 1000000);
+
+-- Материализуем значения в существующих строках
+-- (DEFAULT заполняет только новые вставки, не существующие строки)
+ALTER TABLE financial_transactions
+    MATERIALIZE COLUMN sender_account_id;
+
+ALTER TABLE financial_transactions
+    MATERIALIZE COLUMN receiver_account_id;
+
+-- Добавляем bloom filter индексы
+-- false_positive_rate = 0.01: 1% ложных срабатываний
+-- GRANULARITY 1: индекс на каждую гранулу (8192 строки)
+ALTER TABLE financial_transactions
+    ADD INDEX sender_account_bf sender_account_id
+    TYPE bloom_filter(0.01) GRANULARITY 1;
+
+ALTER TABLE financial_transactions
+    ADD INDEX receiver_account_bf receiver_account_id
+    TYPE bloom_filter(0.01) GRANULARITY 1;
+
+-- Материализуем для существующих данных
+ALTER TABLE financial_transactions
+    MATERIALIZE INDEX sender_account_bf;
+
+ALTER TABLE financial_transactions
+    MATERIALIZE INDEX receiver_account_bf;
+
+-- Проверяем что индексы материализованы
+SELECT
+    name,
+    formatReadableSize(data_compressed_bytes)   AS compressed,
+    formatReadableSize(data_uncompressed_bytes) AS uncompressed,
+    marks_bytes
+FROM system.data_skipping_indices
+WHERE table = 'financial_transactions'
+  AND name IN ('sender_account_bf', 'receiver_account_bf');
+```
+
+```sql
+-- Основной запрос: OR по двум колонкам
+-- Найти все транзакции где аккаунт 42345 участвует в любой роли
+-- Автоматическое использование обоих bloom filter для OR появилось в версии
+-- 25.12.
+--
+-- На более старых версиях OR между разными колонками не позволяет
+-- использовать skip indexes — в этом случае переписываем через UNION ALL:
+--
+--   SELECT ... FROM financial_transactions
+--   WHERE sender_account_id = 42345
+--     AND transaction_date BETWEEN today() - INTERVAL 1 YEAR AND today()
+--   UNION ALL
+--   SELECT ... FROM financial_transactions
+--   WHERE receiver_account_id = 42345
+--     AND transaction_date BETWEEN today() - INTERVAL 1 YEAR AND today()
+--
+-- Каждая ветка UNION ALL выполняется независимо и использует свой
+-- bloom filter — sender_account_bf и receiver_account_bf соответственно.
+--
+-- UNION ALL и параллелизм: ветки выполняются одновременно, но общий пул
+-- потоков делится между ними — при UNION из двух запросов каждая ветка
+-- получает примерно половину. При большом числе подзапросов в UNION ALL
+-- все они открывают буферы чтения одновременно, что может приводить к
+-- пиковому потреблению памяти пропорционально числу веток.
+-- Настройка max_streams_for_union_step, ограничивающая число одновременно
+-- активных потоков в UNION-шаге (снижает пиковую память без потери
+-- параллелизма в целом), появилась в версии 26.5 — на более ранних версиях
+-- число веток UNION ALL приходится ограничивать самостоятельно.
+
+-- * Выполните запрос, чтобы найти реально существующие сгенеренные значения
+-- в sender_account_id и receiver_account_id
+
+SELECT
+    transaction_id,
+    sender_account_id,
+    receiver_account_id,
+    merchant_category,
+    country,
+    transaction_date,
+    amount,
+    status
+FROM financial_transactions
+WHERE (sender_account_id   = 42345 -- подставьте существующее значение
+    OR receiver_account_id = 42345)
+  AND transaction_date BETWEEN today() - INTERVAL 2 YEAR AND today();
+```
+
+```sql
+-- Проверка через EXPLAIN: оба Skip индекса должны быть в выводе
+EXPLAIN indexes = 1
+SELECT
+    transaction_id,
+    sender_account_id,
+    receiver_account_id,
+    amount,
+    status
+FROM financial_transactions
+WHERE (sender_account_id   = 42345 -- подставьте существующее значение
+    OR receiver_account_id = 42345)
+  AND transaction_date BETWEEN today() - INTERVAL 2 YEAR AND today();
+
+--В выводе должна быть секция вида
+--Skip
+--  Name: <Combined skip indexes>
+--  Description: Final set of granules after AND/OR processing
+--  Parts: 16/16
+--  Granules: 29/853
+```
+
+```sql
+-- Замер эффекта: с индексами vs без индексов
+SELECT * FROM financial_transactions
+WHERE (sender_account_id   = 42345 -- подставьте существующее значение
+    OR receiver_account_id = 42345)
+  AND transaction_date BETWEEN today() - INTERVAL 2 YEAR AND today()
+FORMAT Null
+SETTINGS use_query_condition_cache = 0;
+
+SELECT * FROM financial_transactions
+WHERE (sender_account_id   = 42345 -- подставьте существующее значение
+    OR receiver_account_id = 42345)
+  AND transaction_date BETWEEN today() - INTERVAL 2 YEAR AND today()
+FORMAT Null
+SETTINGS use_query_condition_cache = 0, use_skip_indexes = 0;
+```
+
+---
+
+## 4. Не страшный JOIN и словари
+
+ClickHouse постоянно развивается в направлении повышения производительности JOIN,
+и бытовавшее ранее мнение, что эта система не для них, давно неактуально. Чаще
+всего критичное падение производительности происходит из-за грубых ошибок в
+структуре соединений и из-за непропорциональных ресурсам объёмов объединяемых
+данных.
+
+### 4.1 Справочник и «внешний ключ»
+
+```sql
+-- Небольшая таблица: category_id → семантика
+CREATE TABLE merchant_category_dict_source
+(
+    category_id   UInt32,
+    category_name LowCardinality(String), -- совпадает с merchant_category в основной таблице
+    risk_tier     Enum8(
+                      'low'    = 1,
+                      'medium' = 2,
+                      'high'   = 3
+                  ),
+    is_regulated  UInt8                   -- 1 = регулируемая отрасль
+)
+ENGINE = MergeTree
+ORDER BY category_id;
+
+INSERT INTO merchant_category_dict_source VALUES
+    (1,  'Retail',             'low',    0),
+    (2,  'Food & Beverage',    'low',    0),
+    (3,  'Travel',             'medium', 0),
+    (4,  'Healthcare',         'high',   1),
+    (5,  'Entertainment',      'low',    0),
+    (6,  'Utilities',          'medium', 1),
+    (7,  'E-commerce',         'medium', 0),
+    (8,  'Finance',            'high',   1),
+    (9,  'Education',          'low',    1),
+    (10, 'Automotive',         'medium', 0),
+    (11, 'Insurance',          'high',   1),
+    (12, 'Real Estate',        'high',   1),
+    (13, 'Telecommunications', 'medium', 1),
+    (14, 'Gaming',             'medium', 0),
+    (15, 'Gambling',           'high',   1),
+    (16, 'Pharmaceuticals',    'high',   1),
+    (17, 'Logistics',          'medium', 0),
+    (18, 'Agriculture',        'low',    0),
+    (19, 'Media',              'low',    0),
+    (20, 'Government',         'medium', 1);
+```
+
+```sql
+-- Добавляем "внешний ключ" в основную таблицу
+-- Колонка с маппингом merchant_category → category_id
+ALTER TABLE financial_transactions
+    ADD COLUMN category_id UInt32 DEFAULT
+        toUInt32(indexOf(
+            ['Retail', 'Food & Beverage', 'Travel', 'Healthcare',
+             'Entertainment', 'Utilities', 'E-commerce', 'Finance',
+             'Education', 'Automotive', 'Insurance', 'Real Estate',
+             'Telecommunications', 'Gaming', 'Gambling',
+             'Pharmaceuticals', 'Logistics', 'Agriculture', 'Media', 'Government'],
+            merchant_category
+        ));
+
+-- Материализуем для существующих строк
+ALTER TABLE financial_transactions
+    MATERIALIZE COLUMN category_id;
+
+-- Проверяем что маппинг корректный
+SELECT
+    merchant_category,
+    category_id,
+    count() AS cnt
+FROM financial_transactions
+GROUP BY merchant_category, category_id
+ORDER BY category_id;
+```
+
+```sql
+-- Bloom filter на category_id
+--
+-- ВАЖНО: эффективность bloom filter напрямую зависит от корреляции
+-- индексируемой колонки с ORDER BY таблицы.
+--
+-- merchant_category — первый ключ ORDER BY, а category_id является
+-- её прямым производным (маппинг 1:1). Данные физически сгруппированы
+-- на диске по category_id — все строки с category_id = 8 (Finance)
+-- лежат рядом в небольшом числе гранул.
+--
+-- Bloom filter в такой ситуации максимально эффективен: он быстро
+-- отсекает гранулы где нужного category_id заведомо нет.
+--
+-- Если бы category_id был случайным (без корреляции с ORDER BY) —
+-- значения были бы размазаны по всем гранулам и bloom filter
+-- почти не давал бы выигрыша.
+ALTER TABLE financial_transactions
+    ADD INDEX category_id_bf category_id
+    TYPE bloom_filter(0.01) GRANULARITY 1;
+
+ALTER TABLE financial_transactions
+    MATERIALIZE INDEX category_id_bf;
+
+-- Проверяем что индекс материализован
+SELECT
+    name,
+    formatReadableSize(data_compressed_bytes)   AS compressed,
+    formatReadableSize(data_uncompressed_bytes) AS uncompressed,
+    marks_bytes
+FROM system.data_skipping_indices
+WHERE table = 'financial_transactions'
+  AND name = 'category_id_bf';
+```
+
+### 4.2 Словарь — более эффективный метод присоединения семантики
+
+```sql
+CREATE DICTIONARY merchant_category_dict
+(
+    category_id   UInt32,
+    category_name String,
+    risk_tier     String,
+    is_regulated  UInt8
+)
+PRIMARY KEY category_id
+SOURCE(CLICKHOUSE(
+    TABLE 'merchant_category_dict_source'
+    DB currentDatabase()
+))
+LAYOUT(FLAT())          -- FLAT — самый быстрый layout, ключи UInt64, таблица маленькая
+LIFETIME(MIN 300 MAX 900);
+```
+
+### 4.3 JOIN против dictGet
+
+```sql
+-- ============================================================
+-- Вариант A: обычный JOIN
+-- ClickHouse строит хэш-таблицу из merchant_category_dict_source,
+-- затем проверяет каждую строку financial_transactions.
+-- Фильтр по risk_tier применяется ПОСЛЕ джойна.
+--
+-- Начиная с версии 25.10 ClickHouse автоматически строит runtime bloom filter
+-- из правой части JOIN (merchant_category_dict_source) и передаёт его
+-- в сканирование левой части (financial_transactions) ещё до джойна.
+-- Это позволяет отсечь строки financial_transactions у которых category_id
+-- заведомо не встречается в правой части — то есть частично имитирует
+-- поведение которое раньше было доступно только через dictGet.
+-- Тем не менее dictGet остаётся быстрее: словарь уже в памяти,
+-- хэш-таблица не строится заново при каждом запросе, и статический
+-- bloom filter на category_id работает на уровне гранул до чтения данных.
+-- ============================================================
+SELECT
+    ft.merchant_category AS merchant_category,
+    ft.country           AS country,
+    count()              AS tx_count,
+    sum(ft.amount)       AS total_amount,
+    avg(ft.risk_score)   AS avg_risk
+FROM financial_transactions AS ft
+INNER JOIN merchant_category_dict_source AS mcd ON ft.category_id = mcd.category_id
+WHERE mcd.risk_tier = 'high'
+  AND ft.transaction_date BETWEEN today() - INTERVAL 3 YEAR AND today()
+GROUP BY ft.merchant_category, ft.country
+ORDER BY total_amount DESC;
+```
+
+```sql
+-- ============================================================
+-- Вариант B: dictGet — Direct Join
+-- ClickHouse делает lookup прямо в памяти для каждой строки
+-- пережившей фильтр по PRIMARY KEY.
+-- Фильтр по risk_tier вычисляется inline через dictGet,
+-- bloom filter на category_id отсекает ненужные гранулы.
+-- Сравните количество обработанных строк
+-- ============================================================
+SELECT
+    merchant_category,
+    country,
+    count()            AS tx_count,
+    sum(amount)        AS total_amount,
+    avg(risk_score)    AS avg_risk
+FROM financial_transactions
+WHERE dictGet('merchant_category_dict', 'risk_tier', category_id) = 'high'
+  AND transaction_date BETWEEN today() - INTERVAL 3 YEAR AND today()
+GROUP BY merchant_category, country
+ORDER BY total_amount DESC;
+```
+
+Почему `dictGet` быстрее JOIN в этом сценарии:
+
+| | JOIN | dictGet |
+|---|---|---|
+| Построение хэш-таблицы | да, каждый раз | не нужно — словарь уже в RAM |
+| Алгоритм | Hash Join | Direct Join |
+| Фильтр по `risk_tier` | после джойна | inline, строка за строкой |
+| Bloom filter на `category_id` | не используется | отсекает гранулы до lookup |
+| Память | хэш-таблица правой части | только словарь (уже загружен) |
+
+Документация:
+<https://clickhouse.com/docs/concepts/features/dictionaries#speeding-up-joins-using-a-dictionary>
+
+### 4.4 Практика: замеры
+
+При сравнении производительности для более точных результатов можно сбрасывать
+кеши перед очередной итерацией:
+
+```sql
+-- Сбросить mark cache (индексные метки MergeTree)
+SYSTEM DROP MARK CACHE;
+
+-- Сбросить uncompressed cache (несжатые данные)
+SYSTEM DROP UNCOMPRESSED CACHE;
+
+-- Сбросить query cache (результаты запросов)
+SYSTEM CLEAR QUERY CACHE;
+
+-- Сбросить filesystem cache (кеш над S3/Azure/локальными дисками)
+SYSTEM DROP FILESYSTEM CACHE;
+
+-- Сбросить userspace page cache
+SYSTEM DROP PAGE CACHE;
+```
+
+```sql
+-- План для JOIN
+EXPLAIN indexes = 1
+SELECT
+    ft.merchant_category AS merchant_category,
+    ft.country           AS country,
+    count()              AS tx_count,
+    sum(ft.amount)       AS total_amount
+FROM financial_transactions AS ft
+INNER JOIN merchant_category_dict_source AS mcd ON ft.category_id = mcd.category_id
+WHERE mcd.risk_tier = 'high'
+  AND ft.transaction_date BETWEEN today() - INTERVAL 3 YEAR AND today()
+GROUP BY ft.merchant_category, ft.country
+ORDER BY total_amount DESC;
+
+-- План для dictGet
+EXPLAIN indexes = 1
+SELECT
+    merchant_category,
+    country,
+    count()          AS tx_count,
+    sum(amount)      AS total_amount
+FROM financial_transactions
+WHERE dictGet('merchant_category_dict', 'risk_tier', category_id) = 'high'
+  AND transaction_date BETWEEN today() - INTERVAL 3 YEAR AND today()
+GROUP BY merchant_category, country
+ORDER BY total_amount DESC;
+```
+
+```sql
+-- Замер времени
+-- Baseline: JOIN без индексов
+SELECT
+    ft.merchant_category AS merchant_category,
+    ft.country           AS country,
+    count()              AS tx_count,
+    sum(ft.amount)       AS total_amount
+FROM financial_transactions AS ft
+INNER JOIN merchant_category_dict_source AS mcd ON ft.category_id = mcd.category_id
+WHERE mcd.risk_tier = 'high'
+  AND ft.transaction_date BETWEEN today() - INTERVAL 3 YEAR AND today()
+GROUP BY ft.merchant_category, ft.country
+FORMAT Null
+SETTINGS use_query_condition_cache = 0;
+
+-- dictGet с bloom filter
+SELECT
+    merchant_category AS merchant_category,
+    country           AS country,
+    count()           AS tx_count,
+    sum(amount)       AS total_amount
+FROM financial_transactions
+WHERE dictGet('merchant_category_dict', 'risk_tier', category_id) = 'high'
+  AND transaction_date BETWEEN today() - INTERVAL 3 YEAR AND today()
+GROUP BY merchant_category, country
+FORMAT Null
+SETTINGS use_query_condition_cache = 0;
+
+-- dictGet без bloom filter — для чистоты сравнения
+SELECT
+    merchant_category AS merchant_category,
+    country           AS country,
+    count()           AS tx_count,
+    sum(amount)       AS total_amount
+FROM financial_transactions
+WHERE dictGet('merchant_category_dict', 'risk_tier', category_id) = 'high'
+  AND transaction_date BETWEEN today() - INTERVAL 3 YEAR AND today()
+GROUP BY merchant_category, country
+FORMAT Null
+SETTINGS use_query_condition_cache = 0, use_skip_indexes = 0;
+```
+
+```sql
+-- Проверка через query_log
+SELECT
+    query,
+    projections,
+    formatReadableQuantity(read_rows)  AS read_rows,
+    formatReadableQuantity(read_bytes) AS read_bytes,
+    query_duration_ms
+FROM system.query_log
+WHERE type = 'QueryFinish'
+  AND arrayExists(t -> t LIKE '%financial_transactions%', tables)
+  AND query_duration_ms > 0
+ORDER BY initial_query_start_time DESC
+LIMIT 6;
+```
+
+---
+
+## 5. Представления и оконные функции
+
+Оконные функции выносятся на сторону БД, чтобы не передавать сырые данные в BI и
+не считать их там: в DataLens встроенные оконные функции реализуются как агрегации
+над данными, уже полученными из источника.
+
+Переносить вычисления, в том числе оконные, в источник нужно и в том случае, когда
+фильтрация в BI должна выполняться после расчётов. Если результаты оконных
+вычислений должны использоваться как измерения, их также стоит переносить в
+источник.
+
+### 5.1 Представление
+
+Представление позволяет реализовать запрос-витрину, который для внешних систем
+вроде BI выглядит как обычная таблица, и перенести часть логики на сторону БД —
+в том числе вычисления и маскирование полей.
+
+Правило, которым нельзя пренебрегать: в представлениях всем полям задаются явные
+алиасы, а таблицам — короткие псевдонимы; в запросах с несколькими таблицами это
+обязательно. Без этого имена колонок на выходе легко превращаются в
+`alias.field` или `table.field`, и весь датасет в BI ломается на ровном месте.
+Полагаться на автоматический вывод имён нельзя: нет никаких гарантий, что завтра
+в одной из таблиц не появится поле с таким же названием или что к представлению
+не добавят ещё одну таблицу.
+
+```sql
+-- Представление с оконными функциями
+CREATE VIEW financial_transactions_analytics AS
+SELECT
+    ft.transaction_id    AS transaction_id,
+    ft.account_id        AS account_id,
+    ft.merchant_category AS merchant_category,
+    ft.country           AS country,
+    ft.transaction_date  AS transaction_date,
+    ft.amount            AS amount,
+    ft.status            AS status,
+    ft.risk_score        AS risk_score,
+
+    -- Ранг транзакции по сумме внутри категории и страны за месяц
+    -- Партиция: ~200 комбинаций (merchant_category × country × month)
+    rank() OVER (
+        PARTITION BY ft.merchant_category, ft.country,
+                     dateTrunc('month', ft.transaction_date)
+        ORDER BY ft.amount DESC
+    ) AS amount_rank_in_segment,
+
+    -- Доля суммы транзакции от общей суммы по категории и стране
+    round(
+        ft.amount / sum(ft.amount) OVER (
+            PARTITION BY ft.merchant_category, ft.country
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) * 100,
+        2
+    ) AS pct_of_segment_total,
+
+    -- Скользящая сумма по аккаунту (нарастающий итог по дате)
+    -- Партиция: ~1 000 000 аккаунтов — самая дорогая!
+    sum(ft.amount) OVER (
+        PARTITION BY ft.account_id
+        ORDER BY ft.transaction_date
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS account_running_total,
+
+    -- Предыдущая транзакция аккаунта (lag)
+    lagInFrame(ft.amount, 1, 0.) OVER (
+        PARTITION BY ft.account_id
+        ORDER BY ft.transaction_date
+        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS prev_tx_amount,
+
+    -- Отклонение от средней суммы по категории
+    -- Партиция: ~20 категорий
+    round(
+        ft.amount - avg(ft.amount) OVER (
+            PARTITION BY ft.merchant_category
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ),
+        2
+    ) AS diff_from_category_avg,
+
+    -- Перцентильный ранг по risk_score внутри страны
+    -- Партиция: ~20 стран
+    percent_rank() OVER (
+        PARTITION BY ft.country
+        ORDER BY ft.risk_score
+    ) AS risk_percentile_in_country
+
+FROM financial_transactions AS ft
+WHERE ft.status = 'completed';
+```
+
+### 5.2 Стоимость окон
+
+```sql
+-- Запрос к представлению
+-- Топ транзакций с высоким риском, которые одновременно
+-- входят в топ-3 по сумме в своём сегменте
+-- ВАЖНО: этот запрос выполняется медленнее предыдущих, потому что в нём
+-- запрашиваются результаты сразу нескольких оконных функций.
+--
+-- Причина: оконные функции вычисляются для ВСЕХ строк удовлетворяющих
+-- WHERE status = 'completed', и только после этого применяются фильтры
+-- amount_rank_in_segment <= 3 и risk_percentile_in_country > 0.9.
+--
+-- Фильтр по transaction_date частично помогает — PRIMARY KEY таблицы
+-- позволяет ClickHouse отсечь ненужные гранулы до вычисления окон,
+-- но внутри отобранного диапазона все строки всё равно обрабатываются.
+--
+-- Это фундаментальное свойство оконных функций: они требуют полного
+-- прохода по каждой партиции (PARTITION BY) прежде чем вернуть результат.
+SELECT
+    transaction_id,
+    account_id,
+    merchant_category,
+    country,
+    transaction_date,
+    amount,
+    risk_score,
+    amount_rank_in_segment,
+    pct_of_segment_total,
+    risk_percentile_in_country,
+    diff_from_category_avg
+FROM financial_transactions_analytics
+WHERE amount_rank_in_segment <= 3
+  AND risk_percentile_in_country > 0.9
+  AND transaction_date BETWEEN today() - INTERVAL 1 YEAR AND today()
+ORDER BY risk_score DESC, amount DESC
+LIMIT 50;
+```
+
+```sql
+-- Проверка плана выполнения
+EXPLAIN
+SELECT
+    transaction_id,
+    amount_rank_in_segment,
+    risk_percentile_in_country
+FROM financial_transactions_analytics
+WHERE amount_rank_in_segment <= 3
+  AND risk_percentile_in_country > 0.9
+  AND transaction_date BETWEEN today() - INTERVAL 1 YEAR AND today()
+ORDER BY risk_score DESC
+LIMIT 50;
+```
+
+### 5.3 Запрос с одной оконной функцией
+
+В BI целесообразно реализовывать не огромные, сложные для анализа таблицы, а
+наборы графиков, в которых участвует лишь несколько измерений и показателей.
+Если запрос включает лишь одно-два значения из оконной функции — ситуация с
+производительностью значительно лучше, чем при обращении к представлению, где
+вычисляются все оконные функции сразу.
+
+```sql
+-- Нарастающий итог по аккаунту
+SELECT
+    transaction_date,
+    amount,
+    sum(amount) OVER (
+        PARTITION BY account_id
+        ORDER BY transaction_date
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS account_running_total
+FROM financial_transactions
+WHERE account_id = 282208 -- сделайте выборку для получения реальных сгенеренных значений поля для фильтра
+  AND status = 'completed'
+ORDER BY transaction_date;
+```
+
+```sql
+-- EXPLAIN показывает что PRIMARY KEY не отсекает гранулы по account_id —
+-- он стоит четвёртым в ORDER BY после merchant_category, country и month.
+-- Данные физически не сгруппированы по account_id, поэтому ClickHouse
+-- вынужден читать большую часть таблицы.
+-- Оконная функция при этом всё равно вычисляется только для строк
+-- одного аккаунта — PARTITION BY account_id гарантирует это логически,
+-- но не снижает объём физически прочитанных данных.
+--
+-- Если запросы по конкретному account_id критичны — стоит рассмотреть
+-- вынесение account_id на первую позицию в ORDER BY, но это противоречит
+-- текущей модели доступа ориентированной на аналитику по категориям и странам.
+EXPLAIN indexes = 1
+SELECT
+    transaction_date,
+    amount,
+    sum(amount) OVER (
+        PARTITION BY account_id
+        ORDER BY transaction_date
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS account_running_total
+FROM financial_transactions
+WHERE account_id = 282208
+  AND status = 'completed'
+ORDER BY transaction_date;
+```
+
+### 5.4 Селекторы Datalens поверх представления
+
+```sql
+-- Проверяем использование проекции для запроса под селектор поверх представления —
+-- список уникальных категорий с одним измерением через DISTINCT.
+-- Это так же появилось совсем недавно и значительно ускоряет работу дашбордов
+-- с обилием селекторов, построенных на представлениях
+EXPLAIN indexes = 1
+SELECT
+    merchant_category,
+    country,
+    count()         AS total_transactions,
+    sum(amount)     AS revenue,
+    avg(risk_score) AS risk
+FROM financial_transactions
+GROUP BY merchant_category, country
+ORDER BY revenue DESC;
+
+-- Сравниваем с отключённой проекцией чтобы увидеть разницу
+SELECT DISTINCT merchant_category
+FROM financial_transactions
+ORDER BY merchant_category
+SETTINGS optimize_use_projections = 0;
+
+SELECT DISTINCT merchant_category
+FROM financial_transactions
+ORDER BY merchant_category;
+```
+
+```sql
+-- Проверяем через query_log какая проекция была использована
+SYSTEM FLUSH LOGS;
+
+SELECT
+    query,
+    projections,
+    formatReadableQuantity(read_rows) AS read_rows,
+    query_duration_ms
+FROM system.query_log
+WHERE type = 'QueryFinish'
+  AND arrayExists(t -> t LIKE '%financial_transactions%', tables)
+  AND query LIKE '%DISTINCT merchant_category%'
+ORDER BY initial_query_start_time DESC
+LIMIT 4;
+```
+
+---
+
+## 6. Материализованные представления
+
+Для реализации классического подхода с таблицами-агрегатами в Clickhouse можно 
+использовать материализованные представлены и обновляемые материализованные представления.
+
+### 6.1 Инкрементальный MV — триггер на вставку
+
+Обычный материализованный view в ClickHouse — *это триггер на вставку*. Он
+срабатывает при каждом `INSERT` в исходную таблицу и вычисляет агрегаты в момент
+вставки.
+
+Ключевой момент: агрегаты вычисляются над вставляемым блоком, а не над всей
+таблицей. Доагрегация выполняется механизмами SummingMergeTree и
+AggregatingMergeTree на фоновых мержах.
+
+Отдельное правило, нарушение которого ловится не сразу: колонки MV сопоставляются
+с колонками целевой таблицы по именам, а не по позициям.
+
+Осторожно: не рекомендуется использовать в качестве источника
+ReplacingMergeTree и CollapsingMergeTree — MV видит строки до фоновой
+дедупликации и схлопывания, что может привести к некорректным агрегатам.
+Аналогично, при удалении или изменении данных в обычной MergeTree перенос
+изменений в целевые таблицы не произойдёт.
+
+Внимание: если в запросе представления используется несколько таблиц, то триггер
+будет срабатывать при вставке в первую из них и в общем случае не рекомендуется
+строить представление на нескольких таблицах, а при необходимости обогащения данных 
+следует использовать словари `DICTIONARY`.
+
+```sql
+-- ------------------------------------------------------------
+-- MV 1: Агрегация по merchant_category + currency за день
+-- Ускоряет: аналитику оборота по категориям мерчантов
+-- Движок: SummingMergeTree — суммирует числовые колонки
+-- при совпадении ключа сортировки
+-- ------------------------------------------------------------
+-- Целевая таблица
+CREATE TABLE financial_transactions_daily_summary
+(
+    transaction_date  Date,
+    merchant_category LowCardinality(String),
+    currency          LowCardinality(String),
+    total_amount      Decimal(18, 2),
+    total_fee         Decimal(10, 4),
+    tx_count          UInt64
+)
+ENGINE = SummingMergeTree
+ORDER BY (merchant_category, currency, transaction_date);
+
+-- Материализованное представление
+CREATE MATERIALIZED VIEW financial_transactions_daily_summary_mv
+TO financial_transactions_daily_summary
+AS
+SELECT
+    transaction_date,
+    merchant_category,
+    currency,
+    sum(amount)  AS total_amount,
+    sum(fee)     AS total_fee,
+    count()      AS tx_count
+FROM financial_transactions
+GROUP BY transaction_date, merchant_category, currency;
+```
+
+```sql
+-- Тестовая вставка — проверяем что MV срабатывает
+-- и данные попадают в целевую таблицу
+INSERT INTO financial_transactions
+    (transaction_id, account_id, merchant_category, payment_method,
+     country, currency, transaction_date, status,
+     amount, fee, exchange_rate, cashback_amount, risk_score)
+VALUES
+    (1, 1001, 'Retail',          'card',     'US', 'USD', today(), 'completed', 150.00, 1.5000, 1.0, 0.75, 10),
+    (2, 1002, 'Retail',          'transfer', 'DE', 'EUR', today(), 'completed', 200.00, 2.0000, 1.1, 1.00, 20),
+    (3, 1003, 'Food & Beverage', 'card',     'US', 'USD', today(), 'pending',   75.50,  0.7500, 1.0, 0.38, 5),
+    (4, 1004, 'Food & Beverage', 'cash',     'FR', 'EUR', today(), 'completed', 50.00,  0.5000, 1.1, 0.25, 15),
+    (5, 1005, 'Retail',          'crypto',   'US', 'USD', today(), 'failed',    500.00, 5.0000, 1.0, 0.00, 95);
+
+-- Проверяем что данные попали в целевую таблицу
+-- FINAL нужен для SummingMergeTree — схлопывает несмёрженные части
+SELECT
+    merchant_category,
+    currency,
+    sum(total_amount) AS total_amount,
+    sum(tx_count)     AS tx_count
+FROM financial_transactions_daily_summary
+FINAL
+WHERE transaction_date = today()
+GROUP BY merchant_category, currency
+ORDER BY total_amount DESC;
+```
+
+```sql
+-- Backfill исторических данных
+-- (если таблица уже содержала данные до создания MV)
+INSERT INTO financial_transactions_daily_summary
+SELECT
+    transaction_date,
+    merchant_category,
+    currency,
+    sum(amount)  AS total_amount,
+    sum(fee)     AS total_fee,
+    count()      AS tx_count
+FROM financial_transactions
+GROUP BY transaction_date, merchant_category, currency;
+```
+
+### 6.2 AggregatingMergeTree и состояния агрегатов
+
+Там, где нужны не суммы, а средние, уникальные и прочие агрегаты, целевая
+таблица хранит не значения, а частичные состояния: колонки типа
+`AggregateFunction(...)`, заполняемые функциями с суффиксом `-State` и читаемые
+функциями с суффиксом `-Merge`.
+
+```sql
+-- ------------------------------------------------------------
+-- MV 2: Фрод-мониторинг — агрегация по risk_score bucket + country
+-- Ускоряет: анализ распределения рисков по странам
+-- Движок: AggregatingMergeTree — хранит partial aggregate states
+-- ------------------------------------------------------------
+CREATE TABLE financial_transactions_risk_by_country
+(
+    country       LowCardinality(String),
+    risk_bucket   UInt8,          -- 0=low(0-33), 1=medium(34-66), 2=high(67-100)
+    tx_count      AggregateFunction(count),
+    avg_amount    AggregateFunction(avg, Decimal(18, 2)),
+    avg_risk      AggregateFunction(avg, UInt8)
+)
+ENGINE = AggregatingMergeTree
+ORDER BY (country, risk_bucket);
+
+CREATE MATERIALIZED VIEW financial_transactions_risk_by_country_mv
+TO financial_transactions_risk_by_country
+AS
+SELECT
+    country,
+    toUInt8(intDiv(risk_score, 34)) AS risk_bucket,
+    countState()                    AS tx_count,
+    avgState(amount)                AS avg_amount,
+    avgState(risk_score)            AS avg_risk
+FROM financial_transactions
+GROUP BY country, risk_bucket;
+
+-- Backfill существующих данных
+INSERT INTO financial_transactions_risk_by_country
+SELECT
+    country,
+    toUInt8(intDiv(risk_score, 34)) AS risk_bucket,
+    countState()                    AS tx_count,
+    avgState(amount)                AS avg_amount,
+    avgState(risk_score)            AS avg_risk
+FROM financial_transactions
+GROUP BY country, risk_bucket;
+
+-- Пример запроса
+SELECT
+    country,
+    risk_bucket,
+    countMerge(tx_count) AS tx_count,
+    avgMerge(avg_amount) AS avg_amount,
+    avgMerge(avg_risk)   AS avg_risk
+FROM financial_transactions_risk_by_country
+GROUP BY country, risk_bucket
+ORDER BY country, risk_bucket;
+```
+
+### 6.3 Refreshable MV: REPLACE и APPEND
+
+Refreshable MV пересчитывается по расписанию, а не по вставке. Подходит для
+отчётов, где допустима небольшая задержка. На `INSERT` он не реагирует вообще.
+
+Поддерживаются два режима записи:
+
+- **REPLACE** (по умолчанию) — каждый refresh атомарно перезаписывает всё
+  содержимое целевой таблицы, старые данные полностью заменяются новыми.
+  Подходит для текущих состояний, топов, lookup-таблиц.
+- **APPEND** — каждый refresh добавляет строки в конец таблицы, не удаляя
+  старые. Вставка не атомарна, это аналог обычного `INSERT INTO ... SELECT`.
+  Подходит для накопления снапшотов, исторических срезов, периодических отчётов.
+
+| | REPLACE (по умолчанию) | APPEND |
+|---|---|---|
+| Старые данные | удаляются | сохраняются |
+| Атомарность | атомарна | не атомарна |
+| Подходит для | текущее состояние, топы | снапшоты, история, динамика |
+
+Запрос всегда адресуется целевой таблице, а не самому MV.
+
+```sql
+-- ------------------------------------------------------------
+-- Refreshable MV 1: Ежедневный отчёт по статусам транзакций
+-- Режим: REPLACE (по умолчанию) — атомарная полная перезапись
+-- Обновляется каждый день в 03:00 UTC
+-- Пересчитывает ПОЛНОСТЬЮ — подходит для актуального состояния
+-- ВНИМАНИЕ: не реагирует на INSERT, только на расписание!
+-- ------------------------------------------------------------
+-- Целевая таблица (явная, рекомендуется всегда)
+CREATE TABLE financial_transactions_status_report
+(
+    transaction_date  Date,
+    status            Enum8('completed'=1,'pending'=2,'failed'=3,'refunded'=4),
+    merchant_category LowCardinality(String),
+    country           LowCardinality(String),
+    tx_count          UInt64,
+    total_amount      Decimal(18, 2),
+    avg_amount        Float64,
+    total_fee         Decimal(10, 4)
+)
+ENGINE = MergeTree
+ORDER BY (transaction_date, status, merchant_category);
+
+-- Refreshable MV через TO — только определение запроса и расписание
+CREATE MATERIALIZED VIEW financial_transactions_status_report_mv
+REFRESH EVERY 1 DAY OFFSET 3 HOUR
+TO financial_transactions_status_report
+AS
+SELECT
+    transaction_date,
+    status,
+    merchant_category,
+    country,
+    count()      AS tx_count,
+    sum(amount)  AS total_amount,
+    avg(amount)  AS avg_amount,
+    sum(fee)     AS total_fee
+FROM financial_transactions
+WHERE transaction_date >= today() - INTERVAL 90 DAY
+GROUP BY transaction_date, status, merchant_category, country;
+
+-- Принудительный refresh для проверки (не ждём расписания)
+SYSTEM REFRESH VIEW financial_transactions_status_report_mv;
+
+-- Запрос идёт к ЦЕЛЕВОЙ таблице, не к MV!
+SELECT
+    status,
+    merchant_category,
+    sum(tx_count)     AS tx_count,
+    sum(total_amount) AS total_amount
+FROM financial_transactions_status_report  -- <- целевая таблица
+WHERE transaction_date = today()
+GROUP BY status, merchant_category
+ORDER BY total_amount DESC;
+```
+
+```sql
+-- ------------------------------------------------------------
+-- Refreshable MV 2: Исторические снапшоты риска по странам
+-- Режим: APPEND — каждый refresh ДОБАВЛЯЕТ новый срез, не удаляя старые
+-- Обновляется каждый час
+-- Позволяет отслеживать динамику показателей во времени
+-- ВНИМАНИЕ: вставка НЕ атомарна — аналог обычного INSERT INTO ... SELECT
+-- ВНИМАНИЕ: таблица растёт неограниченно — нужен TTL или партиционирование!
+-- ------------------------------------------------------------
+-- Целевая таблица (явная, рекомендуется всегда)
+CREATE TABLE financial_transactions_risk_snapshots
+(
+    snapshot_ts   DateTime,
+    country       LowCardinality(String),
+    tx_count      UInt64,
+    total_amount  Decimal(18, 2),
+    avg_risk      Float64,
+    high_risk_cnt UInt64
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(snapshot_ts)
+ORDER BY (snapshot_ts, country)
+TTL snapshot_ts + INTERVAL 1 YEAR;
+
+-- Refreshable MV с APPEND через TO
+CREATE MATERIALIZED VIEW financial_transactions_risk_snapshots_mv
+REFRESH EVERY 1 HOUR
+APPEND TO financial_transactions_risk_snapshots  -- <- APPEND + явная целевая таблица
+AS
+SELECT
+    now()                    AS snapshot_ts,
+    country,
+    count()                  AS tx_count,
+    sum(amount)              AS total_amount,
+    avg(risk_score)          AS avg_risk,
+    countIf(risk_score > 66) AS high_risk_cnt
+FROM financial_transactions
+WHERE transaction_date >= today() - INTERVAL 7 DAY
+GROUP BY country;
+
+-- Принудительный refresh для проверки
+SYSTEM REFRESH VIEW financial_transactions_risk_snapshots_mv;
+
+-- Запрос идёт к ЦЕЛЕВОЙ таблице, не к MV!
+SELECT
+    snapshot_ts,
+    country,
+    avg_risk,
+    high_risk_cnt
+FROM financial_transactions_risk_snapshots  -- <- целевая таблица
+WHERE snapshot_ts >= now() - INTERVAL 24 HOUR
+ORDER BY snapshot_ts ASC, country;
+```
+
+### 6.4 Что выбирать
+
+| | Инкрементальный MV | Refreshable MV |
+|---|---|---|
+| Обновление | при каждом INSERT | по расписанию |
+| Задержка данных | реальное время | до следующего refresh |
+| JOIN между таблицами | ограниченно | полная поддержка |
+| LIMIT и сложные подзапросы | нет | да |
+| Петабайтные таблицы | да, инкрементально | полный пересчёт |
+| Подходит для | агрегации, трансформации | отчёты, топы, сложная аналитика |
+
+---
+
+## 7. Мониторинг BI-нагрузки
+
+Ключевой момент для BI-нагрузки: смотрите на `total_cpu_sec` (сумма времени всех
+выполнений одного типа запроса), а не на `max_ms` отдельного запроса — именно
+суммарная нагрузка показывает, что реально нагружает систему, когда BI присылает
+пачки запросов.
+
+```sql
+-- Текущие активные запросы прямо сейчас
+-- Что выполняется в данный момент, сгруппировано по типу нагрузки
+SELECT
+    user,
+    count()                                AS query_count,
+    sum(elapsed)                           AS total_elapsed_sec,
+    max(elapsed)                           AS max_elapsed_sec,
+    formatReadableSize(sum(memory_usage))  AS total_memory,
+    formatReadableSize(max(memory_usage))  AS max_memory,
+    formatReadableQuantity(sum(read_rows)) AS total_read_rows,
+    groupArray(left(query, 80))            AS sample_queries
+FROM system.processes
+GROUP BY user
+ORDER BY total_elapsed_sec DESC;
+```
+
+```sql
+-- Куда упирается система: CPU vs IO vs Memory
+-- Агрегированная статистика за последние N минут
+-- Показывает узкие места по типам запросов
+SELECT
+    toStartOfMinute(query_start_time)              AS minute,
+    count()                                        AS total_queries,
+    countIf(query_duration_ms > 1000)              AS slow_queries,
+    countIf(has(tables, 'financial_transactions')) AS ft_queries,
+
+    -- CPU
+    formatReadableQuantity(sum(read_rows))         AS rows_read,
+    round(avg(query_duration_ms))                  AS avg_duration_ms,
+    max(query_duration_ms)                         AS max_duration_ms,
+
+    -- IO
+    formatReadableSize(sum(read_bytes))            AS bytes_read,
+    formatReadableSize(sum(written_bytes))         AS bytes_written,
+
+    -- Memory
+    formatReadableSize(max(memory_usage))          AS peak_memory,
+    formatReadableSize(sum(memory_usage))          AS total_memory,
+
+    -- Параллелизм: сколько запросов шло одновременно
+    max(ProfileEvents['ConcurrentQueriesCount'])   AS max_concurrent
+FROM system.query_log
+WHERE type = 'QueryFinish'
+  AND query_start_time >= now() - INTERVAL 30 MINUTE
+  AND query_start_time < now()
+GROUP BY minute
+ORDER BY minute DESC;
+```
+
+```sql
+-- Топ тяжёлых запросов за период
+-- Находим запросы которые суммарно съедают больше всего ресурсов
+-- normalized_query_hash группирует похожие запросы (с разными параметрами)
+SELECT
+    normalized_query_hash,
+    count()                                AS executions,
+    any(left(query, 120))                  AS sample_query,
+    round(avg(query_duration_ms))          AS avg_ms,
+    max(query_duration_ms)                 AS max_ms,
+    round(sum(query_duration_ms) / 1000)   AS total_cpu_sec,
+    formatReadableSize(avg(memory_usage))  AS avg_memory,
+    formatReadableSize(max(memory_usage))  AS max_memory,
+    formatReadableQuantity(avg(read_rows)) AS avg_rows_read,
+    formatReadableSize(avg(read_bytes))    AS avg_bytes_read,
+    countIf(exception != '')               AS error_count
+FROM system.query_log
+WHERE type = 'QueryFinish'
+  AND query_start_time >= now() - INTERVAL 1 HOUR
+  AND user != 'system'
+GROUP BY normalized_query_hash
+ORDER BY total_cpu_sec DESC
+LIMIT 20;
+```
+
+```sql
+-- Конкурентность: пиковая нагрузка по временным слотам
+-- Видим пики когда BI присылает пачки запросов одновременно
+SELECT
+    toStartOfMinute(query_start_time)                   AS minute,
+    count()                                             AS queries_started,
+    countIf(hasAny(tables, ['financial_transactions'])) AS on_main_table,
+    -- Запросы с подзапросами обычно длиннее и тяжелее
+    countIf(query_duration_ms > 2000)                   AS heavy_queries,
+    countIf(query_duration_ms <= 500)                   AS fast_queries,
+    formatReadableSize(sum(read_bytes))                 AS total_io
+FROM system.query_log
+WHERE type = 'QueryFinish'
+  AND query_start_time >= now() - INTERVAL 2 HOUR
+  AND user != 'system'
+GROUP BY minute
+ORDER BY minute DESC;
+```
+
+```sql
+-- Ожидания на мержах и вставках (конкуренция за ресурсы)
+-- Если BI-запросы конкурируют с фоновыми мержами
+SELECT
+    event_time,
+    metric,
+    value
+FROM system.metric_log
+ARRAY JOIN
+    ['BackgroundMergesAndMutationsPoolTask',
+     'BackgroundMergesAndMutationsPoolSize',
+     'MemoryTracking',
+     'Query',
+     'MergeTreeDataSelectExecutorThreads'] AS metric,
+    [CurrentMetric_BackgroundMergesAndMutationsPoolTask,
+     CurrentMetric_BackgroundMergesAndMutationsPoolSize,
+     CurrentMetric_MemoryTracking,
+     CurrentMetric_Query,
+     CurrentMetric_MergeTreeDataSelectExecutorThreads] AS value
+WHERE event_time >= now() - INTERVAL 10 MINUTE
+ORDER BY event_time DESC, metric ASC
+LIMIT 10;
+```
