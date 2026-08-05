@@ -2020,7 +2020,7 @@ GROUP BY country;
 -- Принудительный refresh для проверки
 SYSTEM REFRESH VIEW financial_transactions_risk_snapshots_mv;
 -- ПРИМЕЧАНИЕ: как и в REPLACE-примере выше, первый refresh происходит
--- автоматически при создании MV — без гранта SYSTEM VIEWS пример отработает.
+-- автоматически при создании MV.
 
 -- Запрос идёт к ЦЕЛЕВОЙ таблице, не к MV!
 SELECT
