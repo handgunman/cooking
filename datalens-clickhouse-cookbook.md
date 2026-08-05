@@ -709,6 +709,56 @@ WHERE transaction_id = 12345678;
 -- вместо idx_by_transaction_id, и настройка max_projection_rows_to_use_projection_index
 -- на выбор не влияет (тестировалось со значением 100000000). Это ровно тот случай,
 -- ради которого нужна проверка из 2.6: наличие проекции не гарантирует её использование.
+
+-- Можно ли заставить использовать именно idx_by_transaction_id явно?
+-- Вариант 1: force_optimize_projection_name — запрашиваем только колонку,
+-- которая физически хранится в этой проекции (transaction_id + _part_offset)
+SELECT transaction_id
+FROM financial_transactions
+WHERE transaction_id = 12345678
+SETTINGS force_optimize_projection_name = 'idx_by_transaction_id';
+
+-- 1 rows in set. Elapsed: 0.010 sec. Processed 303.10 thousand rows, 2.42 MB (30.31 million rows/s., 242.48 MB/s.)
+-- Peak memory usage: 4.39 MiB.
+-- Сработало: projections в query_log = idx_by_transaction_id, прочитано
+-- 303 тыс. строк вместо 50 млн.
+
+-- Вариант 2: тот же force, но с исходным списком колонок (account_id,
+-- amount, status, transaction_date — их в проекции физически нет, только
+-- _part_offset на строку в базовой таблице)
+SELECT transaction_id, account_id, amount, status, transaction_date
+FROM financial_transactions
+WHERE transaction_id = 12345678
+SETTINGS force_optimize_projection_name = 'idx_by_transaction_id';
+
+-- Exception: Code: 117. DB::Exception: Projection idx_by_transaction_id is
+-- specified in setting force_optimize_projection_name but not used. (INCORRECT_DATA)
+--
+-- Вывод: на этой версии force_optimize_projection_name с idx_by_transaction_id
+-- срабатывает, только если SELECT ограничен колонками, реально хранимыми
+-- в проекции (то есть самим ключом). Как только нужна хотя бы одна колонка
+-- из базовой таблицы — механизм "прочитать позицию из индекса, затем
+-- досчитать остальные колонки из базовой таблицы", описанный в тексте
+-- перед 2.5, для force не срабатывает.
+
+-- Вариант 3: preferred_optimize_projection_name — мягкая подсказка вместо
+-- жёсткого требования, с полным списком колонок
+SELECT transaction_id, account_id, amount, status, transaction_date
+FROM financial_transactions
+WHERE transaction_id = 12345678
+SETTINGS preferred_optimize_projection_name = 'idx_by_transaction_id';
+
+-- 1 rows in set. Elapsed: 0.061 sec. Processed 23.77 million rows, 190.20 MB (389.71 million rows/s., 3.12 GB/s.)
+-- Peak memory usage: 5.67 MiB.
+-- projections в query_log пустой — idx_by_transaction_id снова не
+-- используется, но подсказка всё же увела planner от prj_order_by_risk
+-- обратно к базовой таблице, где сработал обычный minmax-индекс из 3.2
+-- (37/116 parts в EXPLAIN, 2917/6149 granules) — 23.77 млн строк вместо 50 млн.
+-- Итог: явно выбрать нужную проекцию в этой версии получилось только для
+-- варианта 1 (узкий SELECT под содержимое самой проекции); для более
+-- широких запросов preferred_... — рабочий способ уйти от нежелательной
+-- normal-проекции, но не способ принудительно включить именно
+-- idx_by_transaction_id.
 ```
 
 ### 2.6 Практика: проверка использования
@@ -2061,8 +2111,8 @@ LIMIT 20;
 -- На реальном шэренном инстансе Managed Service в топ-20 по total_cpu_sec
 -- попадают и запросы других пользователей кластера — сама эта метрика
 -- (сумма времени всех выполнений) для того и нужна, чтобы такие запросы
--- не терялись за max_ms одного запроса. Чужой SQL из вывода в кукбук
--- не копирую, из относящихся к этому кукбуку строк, например:
+-- не терялись за max_ms одного запроса. Ниже — только строки, относящиеся
+-- к примерам этого кукбука (SQL сторонних пользователей опущен как нерелевантный):
 --   avg_ms=5473, max_memory=2.09 GiB, avg_rows_read=50.00 million — запрос из 5.2
 --     (view + несколько оконных функций)
 --   avg_ms=1153, avg_rows_read=50.00 million — dictGet без skip-индексов из 4.4
@@ -2089,9 +2139,10 @@ ORDER BY minute DESC;
 
 -- 121 rows in set. Elapsed: 0.013 sec. Processed 272.42 thousand rows, 1.84 MB (20.96 million rows/s., 141.25 MB/s.)
 -- Peak memory usage: 4.41 MiB.
--- Полные 120+ строк в файл не переношу — по минутам видна фоновая активность
--- на инстансе за пределами этого кукбука (устойчивые 7-60 запросов/мин ещё
--- до начала прогона примеров, т.к. это общий шэренный managed-инстанс).
+-- Полный вывод (120+ строк по минутам) показывает устойчивую фоновую
+-- активность на инстансе ещё до начала работы с примерами этого кукбука
+-- (7-60 запросов/мин) — это общий шэренный managed-инстанс, а не
+-- изолированный стенд.
 ```
 
 ```sql
