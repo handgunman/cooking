@@ -133,7 +133,7 @@ ClickHouse — одна из лучших реализаций этого под
 
 ---
 
-## 1. Проектирование таблиц
+## 1. Проектирование и подготовка таблиц
 
 ### 1.1 Где выполнять работы
 
@@ -393,7 +393,7 @@ GROUP BY transaction_date
 ORDER BY transaction_date;
 -- Ориентировочные параметры выполнения в clickhouse-client
 -- 73 rows in set. Elapsed: 0.066 sec. Processed 2.75 million rows, 79.07 MB (41.33 million rows/s., 1.19 GB/s.)
-Peak memory usage: 19.03 MiB.
+-- Peak memory usage: 19.03 MiB.
 
 -- Запрос 2: фильтр только по payment_method — не входит в PRIMARY KEY/ORDER BY,
 -- поэтому полный скан партиций (демонстрация неэффективного случая)
@@ -407,7 +407,7 @@ GROUP BY merchant_category
 ORDER BY total_amount DESC;
 
 -- 5 rows in set. Elapsed: 0.143 sec. Processed 50.00 million rows, 306.51 MB (350.59 million rows/s., 2.15 GB/s.)
-Peak memory usage: 824.40 KiB.
+-- Peak memory usage: 824.40 KiB.
 ```
 
 Сравнивать по строке итога в clickhouse-client (время, прочитано строк) либо во
@@ -415,7 +415,7 @@ Peak memory usage: 824.40 KiB.
 
 ---
 
-## 2. Проекции
+## 2. Настройка таблиц - проекции
 
 Проекция — дополнительный скрытый набор данных внутри той же таблицы,
 поддерживаемый автоматически при вставке. Фактически это скрытая таблица со
@@ -558,7 +558,7 @@ GROUP BY merchant_category, country
 ORDER BY revenue DESC;
 
 -- 30 rows in set. Elapsed: 0.017 sec. Processed 54.10 thousand rows, 3.61 MB (3.12 million rows/s., 208.32 MB/s.)
-Peak memory usage: 937.27 KiB.
+-- Peak memory usage: 937.27 KiB.
 
 -- Проверка
 EXPLAIN indexes = 1
@@ -613,6 +613,9 @@ FROM financial_transactions
 WHERE account_id = 42345
 GROUP BY month, merchant_category
 ORDER BY month;
+
+-- 27 rows in set. Elapsed: 0.031 sec. Processed 937.86 thousand rows, 44.09 MB (30.25 million rows/s., 1.42 GB/s.)
+-- Peak memory usage: 11.70 MiB.
 ```
 
 ```sql
@@ -645,6 +648,9 @@ WHERE risk_score > 90
   AND amount > 500
 ORDER BY risk_score DESC, amount DESC
 LIMIT 100;
+
+-- 100 rows in set. Elapsed: 0.053 sec. Processed 5.63 million rows, 94.68 MB (106.19 million rows/s., 1.79 GB/s.)
+-- Peak memory usage: 14.27 MiB.
 ```
 
 Начиная с версии 25.5 доступны проекции-индексы (projection index): они хранят
@@ -676,6 +682,21 @@ SELECT
     transaction_date
 FROM financial_transactions
 WHERE transaction_id = 123456789;
+
+-- 0 rows in set. Elapsed: 0.103 sec. Processed 50.00 million rows, 400.00 MB (485.44 million rows/s., 3.88 GB/s.)
+-- Peak memory usage: 4.84 MiB.
+-- ВНИМАНИЕ: transaction_id = 123456789 отсутствует в сгенерированных данных
+-- (значения идут от 1 до 50 000 000), результат ожидаемо пустой.
+
+-- Тот же запрос с реально существующим transaction_id = 12345678:
+-- 1 rows in set. Elapsed: 0.107 sec. Processed 50.00 million rows, 400.00 MB (467.29 million rows/s., 3.74 GB/s.)
+-- Peak memory usage: 5.89 MiB.
+-- ВАЖНО: даже на существующем значении полный скан не исчезает. EXPLAIN indexes = 1
+-- показывает, что запрос читается из проекции prj_order_by_risk (Condition: true,
+-- Parts: 115/115) — planner выбрал более раннюю по порядку добавления normal-проекцию
+-- вместо idx_by_transaction_id, и настройка max_projection_rows_to_use_projection_index
+-- на выбор не влияет (тестировалось со значением 100000000). Это ровно тот случай,
+-- ради которого нужна проверка из 2.6: наличие проекции не гарантирует её использование.
 ```
 
 ### 2.6 Практика: проверка использования
@@ -723,6 +744,11 @@ LIMIT 100
 FORMAT Null
 SETTINGS force_optimize_projection_name = 'prj_order_by_risk';
 
+-- Ошибки нет — force_optimize_projection_name подтверждает, что
+-- prj_order_by_risk реально используется:
+-- 100 rows in set. Elapsed: 0.057 sec. Processed 5.63 million rows, 94.71 MB (98.77 million rows/s., 1.66 GB/s.)
+-- Peak memory usage: 15.29 MiB.
+
 -- Проверяем prj_agg_by_category_country
 SELECT
     merchant_category,
@@ -738,6 +764,26 @@ SETTINGS force_optimize_projection_name = 'prj_agg_by_category_country';
 -- Если проекция не используется — получим ошибку вида:
 -- Exception: Projection prj_agg_by_category_country is specified in setting
 -- force_optimize_projection_name, but it is not used.
+--
+-- ОШИБКА В ЗАПРОСЕ ВЫШЕ: tx_count, total_amount, avg_risk_score — это внутренние
+-- колонки проекции, а не колонки financial_transactions. Запрос падает с
+-- Code: 47. DB::Exception: Unknown expression or function identifier 'tx_count'.
+-- Обращаться нужно к базовым колонкам (как в 2.5) — тогда ClickHouse сам
+-- сопоставит агрегаты с проекцией:
+--
+-- SELECT
+--     merchant_category,
+--     country,
+--     count()         AS total_transactions,
+--     sum(amount)     AS revenue,
+--     avg(risk_score) AS risk
+-- FROM financial_transactions
+-- GROUP BY merchant_category, country
+-- ORDER BY revenue DESC
+-- SETTINGS force_optimize_projection_name = 'prj_agg_by_category_country';
+--
+-- 30 rows in set. Elapsed: 0.016 sec. Processed 47.38 thousand rows, 3.17 MB (2.96 million rows/s., 197.85 MB/s.)
+-- Peak memory usage: 4.84 MiB.
 ```
 
 ```sql
@@ -752,11 +798,17 @@ WHERE type = 'QueryFinish'
   AND arrayExists(t -> t LIKE '%financial_transactions%', tables)
 ORDER BY initial_query_start_time DESC
 LIMIT 10;
+
+-- 10 rows in set. Elapsed: 0.023 sec. Processed 271.41 thousand rows, 3.78 MB (11.80 million rows/s., 164.38 MB/s.)
+-- Peak memory usage: 10.14 MiB.
+-- Колонка projections в выводе явно называет использованную проекцию,
+-- например test.financial_transactions.prj_agg_by_category_country —
+-- это самый прямой способ убедиться в выборе оптимизатора постфактум.
 ```
 
 ---
 
-## 3. Скип-индексы
+## 3. Настройка таблиц - скип-индексы
 
 ### 3.1 Когда работают
 
@@ -854,6 +906,9 @@ SELECT
 FROM system.data_skipping_indices
 WHERE table = 'financial_transactions'
   AND name IN ('sender_account_bf', 'receiver_account_bf');
+
+-- 2 rows in set. Elapsed: 0.078 sec. Processed 15.00 rows, 1.12 KB (192.31 rows/s., 14.40 KB/s.)
+-- Peak memory usage: 4.02 MiB.
 ```
 
 ```sql
@@ -902,6 +957,9 @@ FROM financial_transactions
 WHERE (sender_account_id   = 42345 -- подставьте существующее значение
     OR receiver_account_id = 42345)
   AND transaction_date BETWEEN today() - INTERVAL 2 YEAR AND today();
+
+-- 60 rows in set. Elapsed: 0.046 sec. Processed 1.10 million rows, 16.49 MB (23.80 million rows/s., 358.48 MB/s.)
+-- Peak memory usage: 14.85 MiB.
 ```
 
 ```sql
@@ -935,17 +993,26 @@ WHERE (sender_account_id   = 42345 -- подставьте существующ�
 FORMAT Null
 SETTINGS use_query_condition_cache = 0;
 
+-- 60 rows in set. Elapsed: 0.052 sec. Processed 1.10 million rows, 23.91 MB (21.06 million rows/s., 459.89 MB/s.)
+-- Peak memory usage: 24.75 MiB.
+
 SELECT * FROM financial_transactions
 WHERE (sender_account_id   = 42345 -- подставьте существующее значение
     OR receiver_account_id = 42345)
   AND transaction_date BETWEEN today() - INTERVAL 2 YEAR AND today()
 FORMAT Null
 SETTINGS use_query_condition_cache = 0, use_skip_indexes = 0;
+
+-- 64 rows in set. Elapsed: 0.248 sec. Processed 33.52 million rows, 212.40 MB (135.15 million rows/s., 856.44 MB/s.)
+-- Peak memory usage: 29.67 MiB.
+-- Сравнение: без skip-индексов читается почти вся таблица (33.52 млн строк
+-- вместо 1.10 млн с индексами) — почти в 31 раз больше данных, запрос
+-- примерно в 4.8 раза медленнее.
 ```
 
 ---
 
-## 4. Не страшный JOIN и словари
+## 4. Использование таблиц - не страшный JOIN и словари
 
 ClickHouse постоянно развивается в направлении повышения производительности JOIN,
 и бытовавшее ранее мнение, что эта система не для них, давно неактуально. Чаще
@@ -1020,6 +1087,9 @@ SELECT
 FROM financial_transactions
 GROUP BY merchant_category, category_id
 ORDER BY category_id;
+
+-- 10 rows in set. Elapsed: 1.367 sec. Processed 50.00 million rows, 50.01 MB (36.58 million rows/s., 36.59 MB/s.)
+-- Peak memory usage: 34.72 MiB.
 ```
 
 ```sql
@@ -1055,6 +1125,9 @@ SELECT
 FROM system.data_skipping_indices
 WHERE table = 'financial_transactions'
   AND name = 'category_id_bf';
+
+-- 1 rows in set. Elapsed: 0.004 sec. Processed 16.00 rows, 1.20 KB (4.00 thousand rows/s., 299.75 KB/s.)
+-- Peak memory usage: 4.02 MiB.
 ```
 
 ### 4.2 Словарь — более эффективный метод присоединения семантики
@@ -1107,6 +1180,9 @@ WHERE mcd.risk_tier = 'high'
   AND ft.transaction_date BETWEEN today() - INTERVAL 3 YEAR AND today()
 GROUP BY ft.merchant_category, ft.country
 ORDER BY total_amount DESC;
+
+-- 6 rows in set. Elapsed: 1.256 sec. Processed 50.00 million rows, 650.02 MB (39.81 million rows/s., 517.53 MB/s.)
+-- Peak memory usage: 55.57 MiB.
 ```
 
 ```sql
@@ -1129,6 +1205,12 @@ WHERE dictGet('merchant_category_dict', 'risk_tier', category_id) = 'high'
   AND transaction_date BETWEEN today() - INTERVAL 3 YEAR AND today()
 GROUP BY merchant_category, country
 ORDER BY total_amount DESC;
+
+-- 6 rows in set. Elapsed: 0.247 sec. Processed 11.69 million rows, 198.68 MB (47.31 million rows/s., 804.36 MB/s.)
+-- Peak memory usage: 51.05 MiB.
+-- Сравнение с вариантом A (JOIN): 11.69 млн строк против 50.00 млн — bloom filter
+-- на category_id отсекает лишние гранулы ещё до lookup, запрос быстрее
+-- примерно в 5 раз (0.247 сек против 1.256 сек).
 ```
 
 Почему `dictGet` быстрее JOIN в этом сценарии:
@@ -1211,6 +1293,11 @@ GROUP BY ft.merchant_category, ft.country
 FORMAT Null
 SETTINGS use_query_condition_cache = 0;
 
+-- 6 rows in set. Elapsed: 1.246 sec. Processed 50.00 million rows, 600.02 MB (40.13 million rows/s., 481.55 MB/s.)
+-- Peak memory usage: 41.28 MiB.
+-- (кэши не сбрасывались перед замером — SYSTEM DROP CACHE недоступен для
+-- пользователя mcp_ro и является инстанс-wide операцией)
+
 -- dictGet с bloom filter
 SELECT
     merchant_category AS merchant_category,
@@ -1224,6 +1311,9 @@ GROUP BY merchant_category, country
 FORMAT Null
 SETTINGS use_query_condition_cache = 0;
 
+-- 6 rows in set. Elapsed: 0.219 sec. Processed 11.69 million rows, 186.99 MB (53.36 million rows/s., 853.85 MB/s.)
+-- Peak memory usage: 44.40 MiB.
+
 -- dictGet без bloom filter — для чистоты сравнения
 SELECT
     merchant_category AS merchant_category,
@@ -1236,6 +1326,12 @@ WHERE dictGet('merchant_category_dict', 'risk_tier', category_id) = 'high'
 GROUP BY merchant_category, country
 FORMAT Null
 SETTINGS use_query_condition_cache = 0, use_skip_indexes = 0;
+
+-- 6 rows in set. Elapsed: 1.153 sec. Processed 50.00 million rows, 600.02 MB (43.37 million rows/s., 520.40 MB/s.)
+-- Peak memory usage: 4.86 MiB.
+-- Без skip-индексов dictGet читает все 50 млн строк (как и JOIN), а не 11.69 млн —
+-- разница во времени против предыдущего замера (0.219 сек) подтверждает вклад
+-- именно bloom filter на category_id, а не самого dictGet.
 ```
 
 ```sql
@@ -1252,11 +1348,18 @@ WHERE type = 'QueryFinish'
   AND query_duration_ms > 0
 ORDER BY initial_query_start_time DESC
 LIMIT 6;
+
+-- 6 rows in set. Elapsed: 0.015 sec. Processed 272.69 thousand rows, 4.25 MB (18.18 million rows/s., 283.08 MB/s.)
+-- Peak memory usage: 4.94 MiB.
+-- В колонке projections видно: JOIN-вариант читался через prj_order_by_risk,
+-- а оба dictGet-варианта — напрямую из базовой таблицы ([] в projections).
+-- Наличие подходящей проекции не гарантирует её использование именно там,
+-- где ожидаешь, — ещё один повод для обязательной проверки из 2.6.
 ```
 
 ---
 
-## 5. Представления и оконные функции
+## 5. Использование таблиц - представления и оконные функции
 
 Оконные функции выносятся на сторону БД, чтобы не передавать сырые данные в BI и
 не считать их там: в DataLens встроенные оконные функции реализуются как агрегации
@@ -1320,7 +1423,11 @@ SELECT
     ) AS account_running_total,
 
     -- Предыдущая транзакция аккаунта (lag)
-    lagInFrame(ft.amount, 1, 0.) OVER (
+    -- ВАЖНО: значение по умолчанию должно быть 0, а не 0. — amount имеет тип
+    -- Decimal(18, 2), и для него с Float64-литералом 0. нет общего супертипа
+    -- (Code: 36. DB::Exception: There is no supertype for the argument type
+    -- 'Decimal(18, 2)' and the default value type 'Float64').
+    lagInFrame(ft.amount, 1, 0) OVER (
         PARTITION BY ft.account_id
         ORDER BY ft.transaction_date
         ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
@@ -1384,6 +1491,13 @@ WHERE amount_rank_in_segment <= 3
   AND transaction_date BETWEEN today() - INTERVAL 1 YEAR AND today()
 ORDER BY risk_score DESC, amount DESC
 LIMIT 50;
+
+-- 50 rows in set. Elapsed: 5.473 sec. Processed 50.00 million rows, 1.30 GB (9.14 million rows/s., 237.54 MB/s.)
+-- Peak memory usage: 2.09 GiB.
+-- Подтверждает предупреждение из текста выше: запрос на порядки дороже
+-- single-window запросов из 5.3 — оконные функции считаются по всем строкам
+-- status = 'completed' до применения фильтров amount_rank_in_segment
+-- и risk_percentile_in_country.
 ```
 
 ```sql
@@ -1423,6 +1537,9 @@ FROM financial_transactions
 WHERE account_id = 282208 -- сделайте выборку для получения реальных сгенеренных значений поля для фильтра
   AND status = 'completed'
 ORDER BY transaction_date;
+
+-- 57 rows in set. Elapsed: 0.064 sec. Processed 50.00 million rows, 252.42 MB (781.25 million rows/s., 3.94 GB/s.)
+-- Peak memory usage: 6.13 MiB.
 ```
 
 ```sql
@@ -1452,7 +1569,7 @@ WHERE account_id = 282208
 ORDER BY transaction_date;
 ```
 
-### 5.4 Селекторы Datalens поверх представления
+### 5.4 Селекторы поверх представления
 
 ```sql
 -- Проверяем использование проекции для запроса под селектор поверх представления —
@@ -1476,9 +1593,22 @@ FROM financial_transactions
 ORDER BY merchant_category
 SETTINGS optimize_use_projections = 0;
 
+-- 10 rows in set. Elapsed: 0.042 sec. Processed 50.00 million rows, 50.01 MB (1.19 billion rows/s., 1.19 GB/s.)
+-- Peak memory usage: 14.34 MiB.
+
 SELECT DISTINCT merchant_category
 FROM financial_transactions
 ORDER BY merchant_category;
+
+-- 10 rows in set. Elapsed: 0.041 sec. Processed 50.00 million rows, 50.01 MB (1.22 billion rows/s., 1.22 GB/s.)
+-- Peak memory usage: 13.34 MiB.
+-- ВАЖНО: результат практически идентичен предыдущему запросу с отключёнными
+-- проекциями. EXPLAIN indexes = 1 показывает чтение из базовой таблицы
+-- (ReadFromMergeTree test.financial_transactions), а не из
+-- prj_agg_by_category_country; в query_log поле projections пустое ([]).
+-- На этой версии (26.3.17) автоматическое использование агрегирующей
+-- проекции для DISTINCT не сработало, хотя формально доступно с 25.11 —
+-- лишний повод не полагаться на release notes без проверки на своих данных.
 ```
 
 ```sql
@@ -1496,11 +1626,16 @@ WHERE type = 'QueryFinish'
   AND query LIKE '%DISTINCT merchant_category%'
 ORDER BY initial_query_start_time DESC
 LIMIT 4;
+
+-- 4 rows in set. Elapsed: 0.033 sec. Processed 281.21 thousand rows, 34.19 MB (8.52 million rows/s., 1.04 GB/s.)
+-- Peak memory usage: 41.31 MiB.
+-- Оба запроса SELECT DISTINCT ... в выборке дают пустой projections —
+-- ещё одно прямое подтверждение, что проекция здесь не задействована.
 ```
 
 ---
 
-## 6. Материализованные представления
+## 6. Производные таблицы - материализованные представления
 
 Для реализации классического подхода с таблицами-агрегатами в Clickhouse можно 
 использовать материализованные представлены и обновляемые материализованные представления.
@@ -1567,16 +1702,18 @@ GROUP BY transaction_date, merchant_category, currency;
 ```sql
 -- Тестовая вставка — проверяем что MV срабатывает
 -- и данные попадают в целевую таблицу
+-- ПРИМЕЧАНИЕ: transaction_id взяты 50000001..50000005, а не 1..5 — значения
+-- 1..5 уже заняты сквозной генерацией из 1.6 (numbers(50000000)).
 INSERT INTO financial_transactions
     (transaction_id, account_id, merchant_category, payment_method,
      country, currency, transaction_date, status,
      amount, fee, exchange_rate, cashback_amount, risk_score)
 VALUES
-    (1, 1001, 'Retail',          'card',     'US', 'USD', today(), 'completed', 150.00, 1.5000, 1.0, 0.75, 10),
-    (2, 1002, 'Retail',          'transfer', 'DE', 'EUR', today(), 'completed', 200.00, 2.0000, 1.1, 1.00, 20),
-    (3, 1003, 'Food & Beverage', 'card',     'US', 'USD', today(), 'pending',   75.50,  0.7500, 1.0, 0.38, 5),
-    (4, 1004, 'Food & Beverage', 'cash',     'FR', 'EUR', today(), 'completed', 50.00,  0.5000, 1.1, 0.25, 15),
-    (5, 1005, 'Retail',          'crypto',   'US', 'USD', today(), 'failed',    500.00, 5.0000, 1.0, 0.00, 95);
+    (50000001, 1001, 'Retail',          'card',     'US', 'USD', today(), 'completed', 150.00, 1.5000, 1.0, 0.75, 10),
+    (50000002, 1002, 'Retail',          'transfer', 'DE', 'EUR', today(), 'completed', 200.00, 2.0000, 1.1, 1.00, 20),
+    (50000003, 1003, 'Food & Beverage', 'card',     'US', 'USD', today(), 'pending',   75.50,  0.7500, 1.0, 0.38, 5),
+    (50000004, 1004, 'Food & Beverage', 'cash',     'FR', 'EUR', today(), 'completed', 50.00,  0.5000, 1.1, 0.25, 15),
+    (50000005, 1005, 'Retail',          'crypto',   'US', 'USD', today(), 'failed',    500.00, 5.0000, 1.0, 0.00, 95);
 
 -- Проверяем что данные попали в целевую таблицу
 -- FINAL нужен для SummingMergeTree — схлопывает несмёрженные части
@@ -1590,6 +1727,9 @@ FINAL
 WHERE transaction_date = today()
 GROUP BY merchant_category, currency
 ORDER BY total_amount DESC;
+
+-- 4 rows in set. Elapsed: 0.004 sec. Processed 4.00 rows, 155.00 B (1.00 thousand rows/s., 38.75 KB/s.)
+-- Peak memory usage: 4.23 MiB.
 ```
 
 ```sql
@@ -1664,6 +1804,9 @@ SELECT
 FROM financial_transactions_risk_by_country
 GROUP BY country, risk_bucket
 ORDER BY country, risk_bucket;
+
+-- 45 rows in set. Elapsed: 0.004 sec. Processed 45.00 rows, 3.49 KB (11.25 thousand rows/s., 872.00 KB/s.)
+-- Peak memory usage: 237.45 KiB.
 ```
 
 ### 6.3 Refreshable MV: REPLACE и APPEND
@@ -1731,6 +1874,10 @@ GROUP BY transaction_date, status, merchant_category, country;
 
 -- Принудительный refresh для проверки (не ждём расписания)
 SYSTEM REFRESH VIEW financial_transactions_status_report_mv;
+-- ПРИМЕЧАНИЕ: SYSTEM REFRESH VIEW требует отдельный грант SYSTEM VIEWS,
+-- которого у read-only пользователя может не быть. Проверять это не
+-- обязательно: Refreshable MV без EMPTY выполняет первый refresh сразу
+-- при создании, поэтому данные в целевой таблице уже есть.
 
 -- Запрос идёт к ЦЕЛЕВОЙ таблице, не к MV!
 SELECT
@@ -1742,6 +1889,9 @@ FROM financial_transactions_status_report  -- <- целевая таблица
 WHERE transaction_date = today()
 GROUP BY status, merchant_category
 ORDER BY total_amount DESC;
+
+-- 4 rows in set. Elapsed: 0.004 sec. Processed 361.00 rows, 7.40 KB (90.25 thousand rows/s., 1.85 MB/s.)
+-- Peak memory usage: 4.23 MiB.
 ```
 
 ```sql
@@ -1786,6 +1936,8 @@ GROUP BY country;
 
 -- Принудительный refresh для проверки
 SYSTEM REFRESH VIEW financial_transactions_risk_snapshots_mv;
+-- ПРИМЕЧАНИЕ: как и в 6.3 REPLACE-примере, первый refresh уже произошёл
+-- автоматически при создании MV, отдельный грант SYSTEM VIEWS не понадобился.
 
 -- Запрос идёт к ЦЕЛЕВОЙ таблице, не к MV!
 SELECT
@@ -1796,6 +1948,13 @@ SELECT
 FROM financial_transactions_risk_snapshots  -- <- целевая таблица
 WHERE snapshot_ts >= now() - INTERVAL 24 HOUR
 ORDER BY snapshot_ts ASC, country;
+
+-- 9 rows in set. Elapsed: 0.005 sec. Processed 9.00 rows, 287.00 B (1.80 thousand rows/s., 57.40 KB/s.)
+-- Peak memory usage: 4.20 MiB.
+-- 9, а не 15 стран — потому что в срез transaction_date >= today() - INTERVAL 7 DAY
+-- попадают только страны, для которых в сквозной генерации 1.6
+-- (today() - 1095 + rand() % 1095, максимум — «вчера») или в тестовой
+-- вставке из 6.1 (today(), страны US/DE/FR) нашлись строки за последнюю неделю.
 ```
 
 ### 6.4 Что выбирать
@@ -1833,6 +1992,11 @@ SELECT
 FROM system.processes
 GROUP BY user
 ORDER BY total_elapsed_sec DESC;
+
+-- 1 rows in set. Elapsed: 0.004 sec. Processed 1.00 rows, 3.38 KB (250.00 rows/s., 843.75 KB/s.)
+-- Peak memory usage: 4.02 MiB.
+-- На момент прогона в system.processes виден только сам этот запрос —
+-- других активных сессий на инстансе не было.
 ```
 
 ```sql
@@ -1866,6 +2030,15 @@ WHERE type = 'QueryFinish'
   AND query_start_time < now()
 GROUP BY minute
 ORDER BY minute DESC;
+
+-- 31 rows in set. Elapsed: 0.016 sec. Processed 271.88 thousand rows, 1.45 MB (16.99 million rows/s., 90.48 MB/s.)
+-- Peak memory usage: 5.31 MiB.
+-- ВАЖНО: ft_queries получился 0 на всех строках, хотя запросов
+-- к financial_transactions за эти 30 минут были десятки. has(tables, 'financial_transactions')
+-- ищет точное совпадение строки, а в system.query_log таблица записана
+-- с префиксом БД — 'test.financial_transactions'. Рабочий вариант:
+-- countIf(hasAny(tables, ['test.financial_transactions'])) или
+-- countIf(arrayExists(t -> t LIKE '%financial_transactions%', tables)) — как в 2.6.
 ```
 
 ```sql
@@ -1891,6 +2064,18 @@ WHERE type = 'QueryFinish'
 GROUP BY normalized_query_hash
 ORDER BY total_cpu_sec DESC
 LIMIT 20;
+
+-- 20 rows in set. Elapsed: 0.020 sec. Processed 271.90 thousand rows, 3.20 MB (13.60 million rows/s., 160.11 MB/s.)
+-- Peak memory usage: 5.31 MiB.
+-- На реальном шэренном инстансе Managed Service в топ-20 по total_cpu_sec
+-- попадают и запросы других пользователей кластера — сама эта метрика
+-- (сумма времени всех выполнений) для того и нужна, чтобы такие запросы
+-- не терялись за max_ms одного запроса. Чужой SQL из вывода в кукбук
+-- не копирую, из относящихся к этому кукбуку строк, например:
+--   avg_ms=5473, max_memory=2.09 GiB, avg_rows_read=50.00 million — запрос из 5.2
+--     (view + несколько оконных функций)
+--   avg_ms=1153, avg_rows_read=50.00 million — dictGet без skip-индексов из 4.4
+--   avg_ms=804,  avg_rows_read=50.00 million — backfill INSERT в 6.1
 ```
 
 ```sql
@@ -1910,6 +2095,15 @@ WHERE type = 'QueryFinish'
   AND user != 'system'
 GROUP BY minute
 ORDER BY minute DESC;
+
+-- 121 rows in set. Elapsed: 0.011 sec. Processed 271.93 thousand rows, 1.82 MB (24.72 million rows/s., 165.51 MB/s.)
+-- Peak memory usage: 4.39 MiB.
+-- on_main_table снова везде 0 — та же причина, что и в предыдущем запросе
+-- (hasAny ищет 'financial_transactions' без префикса БД, а в tables хранится
+-- 'test.financial_transactions'). Полные 120+ строк в файл не переношу —
+-- по минутам видна фоновая активность на инстансе за пределами этого
+-- кукбука (устойчивые 7-60 запросов/мин ещё до начала прогона примеров,
+-- т.к. это общий шэренный managed-инстанс).
 ```
 
 ```sql
