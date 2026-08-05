@@ -235,7 +235,7 @@ JOIN остаётся относительно дорогой операцией
 
 ### 1.4 Дата в ключе сортировки
 
- Большинстве случаев аналитическая обработка связана с интервалами дат и времени и поля с ними - очевидный кандидат в ORDER BY.
+ В большинстве случаев аналитическая обработка связана с интервалами дат и времени и поля с ними - очевидный кандидат в ORDER BY.
 
 Типовая ошибка.
 
@@ -761,11 +761,10 @@ SETTINGS preferred_optimize_projection_name = 'idx_by_transaction_id';
 -- источником), но подсказка увела planner от prj_order_by_risk к базовой
 -- таблице — а на ней idx_by_transaction_id сработал как ВТОРИЧНЫЙ индекс
 -- (ровно тот механизм "_part_offset", что описан в тексте перед 2.5):
--- 23.77 млн строк вместо 50 млн. Проверено явно: результат ОДИНАКОВ и с
--- ещё не существующим на этом этапе idx_minmax_transaction_id из 3.2,
--- и без него (тестировалось через временный DROP INDEX) — сокращение
--- даёт именно idx_by_transaction_id, а не совпадение с более поздним
--- minmax-индексом. Итог: явно направить planner на idx_by_transaction_id
+-- 23.77 млн строк вместо 50 млн. Сокращение даёт именно
+-- idx_by_transaction_id: результат не меняется от наличия или отсутствия
+-- minmax-индекса по transaction_id из 3.2 (проверяется временным
+-- DROP INDEX). Итог: явно направить planner на idx_by_transaction_id
 -- как первичный источник получилось только для варианта 1 (узкий SELECT
 -- под содержимое самой проекции); для более широких запросов
 -- preferred_... не подключает её как первичный источник, но помогает
@@ -889,7 +888,7 @@ LIMIT 10;
 -- 10 rows in set. Elapsed: 0.023 sec. Processed 271.41 thousand rows, 3.78 MB (11.80 million rows/s., 164.38 MB/s.)
 -- Peak memory usage: 10.14 MiB.
 -- Колонка projections в выводе явно называет использованную проекцию,
--- например test.financial_transactions.prj_agg_by_category_country —
+-- например <база>.financial_transactions.prj_agg_by_category_country —
 -- это самый прямой способ убедиться в выборе оптимизатора постфактум.
 ```
 
@@ -942,7 +941,7 @@ WHERE transaction_id = 97234;
 -- Parts: 36/109   <- чем меньше левое число, тем лучше работает индекс
 -- Granules: 2955/6146
 ```
-Если индекс не используется, то, вероятно risk_score и amount не коррелируют с ключом сортировки. 
+Если индекс не отсекает парты, то, вероятно, значения transaction_id внутри партов не монотонны — то есть порядок вставки не коррелирует с ключом сортировки таблицы.
 
 ### 3.3 Практика: bloom filter и OR по двум колонкам
 
@@ -1382,8 +1381,8 @@ SETTINGS use_query_condition_cache = 0;
 
 -- 6 rows in set. Elapsed: 1.246 sec. Processed 50.00 million rows, 600.02 MB (40.13 million rows/s., 481.55 MB/s.)
 -- Peak memory usage: 41.28 MiB.
--- (кэши не сбрасывались перед замером — SYSTEM DROP CACHE недоступен для
--- пользователя mcp_ro и является инстанс-wide операцией)
+-- (кэши не сбрасывались перед замером — SYSTEM DROP CACHE недоступен
+-- read-only пользователю и является инстанс-wide операцией)
 
 -- dictGet с bloom filter
 SELECT
@@ -1713,7 +1712,7 @@ LIMIT 4;
 -- 3 rows in set. Elapsed: 0.033 sec. Processed 275.27 thousand rows, 34.28 MB (8.34 million rows/s., 1.04 GB/s.)
 -- Peak memory usage: 33.33 MiB.
 -- В строке без SETTINGS optimize_use_projections = 0 поле projections
--- заполнено — test.financial_transactions.prj_agg_by_category_country —
+-- заполнено — <база>.financial_transactions.prj_agg_by_category_country —
 -- то же самое, что видно и в EXPLAIN.
 ```
 
@@ -1959,8 +1958,8 @@ GROUP BY transaction_date, status, merchant_category, country;
 -- Принудительный refresh для проверки (не ждём расписания)
 SYSTEM REFRESH VIEW financial_transactions_status_report_mv;
 -- ПРИМЕЧАНИЕ: SYSTEM REFRESH VIEW требует отдельный грант SYSTEM VIEWS,
--- которого у read-only пользователя может не быть. Проверять это не
--- обязательно: Refreshable MV без EMPTY выполняет первый refresh сразу
+-- которого у read-only пользователя может не быть. Для примера это не
+-- препятствие: Refreshable MV без EMPTY выполняет первый refresh сразу
 -- при создании, поэтому данные в целевой таблице уже есть.
 
 -- Запрос идёт к ЦЕЛЕВОЙ таблице, не к MV!
@@ -2020,8 +2019,8 @@ GROUP BY country;
 
 -- Принудительный refresh для проверки
 SYSTEM REFRESH VIEW financial_transactions_risk_snapshots_mv;
--- ПРИМЕЧАНИЕ: как и в 6.3 REPLACE-примере, первый refresh уже произошёл
--- автоматически при создании MV, отдельный грант SYSTEM VIEWS не понадобился.
+-- ПРИМЕЧАНИЕ: как и в REPLACE-примере выше, первый refresh происходит
+-- автоматически при создании MV — без гранта SYSTEM VIEWS пример отработает.
 
 -- Запрос идёт к ЦЕЛЕВОЙ таблице, не к MV!
 SELECT
@@ -2079,8 +2078,8 @@ ORDER BY total_elapsed_sec DESC;
 
 -- 1 rows in set. Elapsed: 0.004 sec. Processed 1.00 rows, 3.38 KB (250.00 rows/s., 843.75 KB/s.)
 -- Peak memory usage: 4.02 MiB.
--- На момент прогона в system.processes виден только сам этот запрос —
--- других активных сессий на инстансе не было.
+-- Если других активных сессий нет, в выводе будет только сам этот запрос:
+-- system.processes показывает срез на текущий момент, а не историю.
 ```
 
 ```sql
@@ -2091,7 +2090,7 @@ SELECT
     toStartOfMinute(query_start_time)              AS minute,
     count()                                        AS total_queries,
     countIf(query_duration_ms > 1000)              AS slow_queries,
-    countIf(hasAny(tables, ['test.financial_transactions'])) AS ft_queries,
+    countIf(hasAny(tables, [currentDatabase() || '.financial_transactions'])) AS ft_queries,
 
     -- CPU
     formatReadableQuantity(sum(read_rows))         AS rows_read,
@@ -2118,8 +2117,9 @@ ORDER BY minute DESC;
 -- 31 rows in set. Elapsed: 0.016 sec. Processed 272.38 thousand rows, 1.48 MB (17.02 million rows/s., 92.20 MB/s.)
 -- Peak memory usage: 4.49 MiB.
 -- hasAny() ищет точное совпадение строки, а в system.query_log таблица
--- записана с префиксом БД — используйте полное имя 'test.financial_transactions'
--- (или свою схему), иначе ft_queries всегда будет 0.
+-- записана с префиксом БД — сравнивать нужно с полным именем
+-- (currentDatabase() || '.financial_transactions'), иначе ft_queries
+-- всегда будет 0.
 ```
 
 ```sql
@@ -2151,8 +2151,8 @@ LIMIT 20;
 -- На реальном шэренном инстансе Managed Service в топ-20 по total_cpu_sec
 -- попадают и запросы других пользователей кластера — сама эта метрика
 -- (сумма времени всех выполнений) для того и нужна, чтобы такие запросы
--- не терялись за max_ms одного запроса. Ниже — только строки, относящиеся
--- к примерам этого кукбука (SQL сторонних пользователей опущен как нерелевантный):
+-- не терялись за max_ms одного запроса. Строки, относящиеся к примерам
+-- этого кукбука, выглядят так:
 --   avg_ms=5473, max_memory=2.09 GiB, avg_rows_read=50.00 million — запрос из 5.2
 --     (view + несколько оконных функций)
 --   avg_ms=1153, avg_rows_read=50.00 million — dictGet без skip-индексов из 4.4
@@ -2165,7 +2165,7 @@ LIMIT 20;
 SELECT
     toStartOfMinute(query_start_time)                   AS minute,
     count()                                             AS queries_started,
-    countIf(hasAny(tables, ['test.financial_transactions'])) AS on_main_table,
+    countIf(hasAny(tables, [currentDatabase() || '.financial_transactions'])) AS on_main_table,
     -- Запросы с подзапросами обычно длиннее и тяжелее
     countIf(query_duration_ms > 2000)                   AS heavy_queries,
     countIf(query_duration_ms <= 500)                   AS fast_queries,
@@ -2179,10 +2179,10 @@ ORDER BY minute DESC;
 
 -- 121 rows in set. Elapsed: 0.013 sec. Processed 272.42 thousand rows, 1.84 MB (20.96 million rows/s., 141.25 MB/s.)
 -- Peak memory usage: 4.41 MiB.
--- Полный вывод (120+ строк по минутам) показывает устойчивую фоновую
--- активность на инстансе ещё до начала работы с примерами этого кукбука
--- (7-60 запросов/мин) — это общий шэренный managed-инстанс, а не
--- изолированный стенд.
+-- На шэренном managed-инстансе в выводе видна устойчивая фоновая активность
+-- (десятки запросов в минуту), не связанная с примерами кукбука. Учитывайте
+-- это при интерпретации пиков: без фильтра по своему пользователю или по
+-- своей таблице картина смешивает вашу нагрузку с чужой.
 ```
 
 ```sql
