@@ -705,10 +705,17 @@ WHERE transaction_id = 12345678;
 -- Peak memory usage: 5.89 MiB.
 -- ВАЖНО: полный скан не исчезает даже на существующем значении. EXPLAIN indexes = 1
 -- показывает, что запрос читается из проекции prj_order_by_risk (Condition: true,
--- Parts: 115/115) — planner выбрал более раннюю по порядку добавления normal-проекцию
--- вместо idx_by_transaction_id, и настройка max_projection_rows_to_use_projection_index
--- на выбор не влияет (тестировалось со значением 100000000). Это ровно тот случай,
--- ради которого нужна проверка из 2.6: наличие проекции не гарантирует её использование.
+-- Parts: 115/115), а не из idx_by_transaction_id или базовой таблицы. На этом
+-- этапе кукбука у базовой таблицы ещё нет собственного индекса по
+-- transaction_id (он появится в 3.2) — оба варианта чтения дают одинаковую
+-- оценку стоимости (полный скан), и planner предпочитает готовую копию
+-- prj_order_by_risk. Проверено: после добавления в 3.2 обычного minmax-индекса
+-- по transaction_id этот же запрос без всяких настроек начинает читать уже
+-- из базовой таблицы (см. 3.2) — то есть выбор проекции не зафиксирован
+-- навсегда, а меняется по мере того, как в таблице появляются более
+-- дешёвые альтернативы. Это ровно тот случай, ради которого нужна проверка
+-- из 2.6: наличие проекции не гарантирует её использование, и однажды
+-- снятый EXPLAIN не гарантирует, что план не поменяется в будущем.
 
 -- Можно ли заставить использовать именно idx_by_transaction_id явно?
 -- Вариант 1: force_optimize_projection_name — запрашиваем только колонку,
@@ -734,12 +741,12 @@ SETTINGS force_optimize_projection_name = 'idx_by_transaction_id';
 -- Exception: Code: 117. DB::Exception: Projection idx_by_transaction_id is
 -- specified in setting force_optimize_projection_name but not used. (INCORRECT_DATA)
 --
--- Вывод: на этой версии force_optimize_projection_name с idx_by_transaction_id
--- срабатывает, только если SELECT ограничен колонками, реально хранимыми
--- в проекции (то есть самим ключом). Как только нужна хотя бы одна колонка
--- из базовой таблицы — механизм "прочитать позицию из индекса, затем
--- досчитать остальные колонки из базовой таблицы", описанный в тексте
--- перед 2.5, для force не срабатывает.
+-- Вывод: force_optimize_projection_name требует, чтобы idx_by_transaction_id
+-- стал ПЕРВИЧНЫМ источником чтения — а это возможно только если SELECT
+-- ограничен колонками, реально хранимыми в проекции (то есть самим ключом).
+-- Как только нужна хотя бы одна колонка из базовой таблицы, force его
+-- не принимает — хотя (см. вариант 3) как ВТОРИЧНЫЙ индекс для отсечения
+-- партов idx_by_transaction_id в таких запросах всё равно участвует.
 
 -- Вариант 3: preferred_optimize_projection_name — мягкая подсказка вместо
 -- жёсткого требования, с полным списком колонок
@@ -750,15 +757,48 @@ SETTINGS preferred_optimize_projection_name = 'idx_by_transaction_id';
 
 -- 1 rows in set. Elapsed: 0.061 sec. Processed 23.77 million rows, 190.20 MB (389.71 million rows/s., 3.12 GB/s.)
 -- Peak memory usage: 5.67 MiB.
--- projections в query_log пустой — idx_by_transaction_id снова не
--- используется, но подсказка всё же увела planner от prj_order_by_risk
--- обратно к базовой таблице, где сработал обычный minmax-индекс из 3.2
--- (37/116 parts в EXPLAIN, 2917/6149 granules) — 23.77 млн строк вместо 50 млн.
--- Итог: явно выбрать нужную проекцию в этой версии получилось только для
--- варианта 1 (узкий SELECT под содержимое самой проекции); для более
--- широких запросов preferred_... — рабочий способ уйти от нежелательной
--- normal-проекции, но не способ принудительно включить именно
--- idx_by_transaction_id.
+-- projections в query_log пустой (idx_by_transaction_id не стал ПЕРВИЧНЫМ
+-- источником), но подсказка увела planner от prj_order_by_risk к базовой
+-- таблице — а на ней idx_by_transaction_id сработал как ВТОРИЧНЫЙ индекс
+-- (ровно тот механизм "_part_offset", что описан в тексте перед 2.5):
+-- 23.77 млн строк вместо 50 млн. Проверено явно: результат ОДИНАКОВ и с
+-- ещё не существующим на этом этапе idx_minmax_transaction_id из 3.2,
+-- и без него (тестировалось через временный DROP INDEX) — сокращение
+-- даёт именно idx_by_transaction_id, а не совпадение с более поздним
+-- minmax-индексом. Итог: явно направить planner на idx_by_transaction_id
+-- как первичный источник получилось только для варианта 1 (узкий SELECT
+-- под содержимое самой проекции); для более широких запросов
+-- preferred_... не подключает её как первичный источник, но помогает
+-- получить пользу от неё как от вторичного индекса на базовой таблице.
+
+-- Вариант 4: расширить саму проекцию нужными колонками, а не оставлять
+-- только ключ. Компактный синтаксис `INDEX ... TYPE basic` даёт только
+-- ключ + _part_offset, но обычным ADD PROJECTION можно явно перечислить
+-- любой набор колонок (не обязательно SELECT * целиком):
+ALTER TABLE financial_transactions
+ADD PROJECTION idx_by_transaction_id_wide
+(
+    SELECT transaction_id, account_id, amount, status, transaction_date
+    ORDER BY transaction_id
+);
+
+ALTER TABLE financial_transactions
+    MATERIALIZE PROJECTION idx_by_transaction_id_wide;
+
+-- Тот же запрос, уже без каких-либо SETTINGS
+SELECT transaction_id, account_id, amount, status, transaction_date
+FROM financial_transactions
+WHERE transaction_id = 12345678;
+
+-- 1 rows in set. Elapsed: 0.010 sec. Processed 303.10 thousand rows, 2.55 MB (30.31 million rows/s., 254.77 MB/s.)
+-- Peak memory usage: 4.35 MiB.
+-- Планировщик сам, без единой настройки, выбрал idx_by_transaction_id_wide
+-- (EXPLAIN indexes = 1: ReadFromMergeTree (idx_by_transaction_id_wide),
+-- PrimaryKey по transaction_id, binary search, Parts: 37/37, Granules: 37/2917;
+-- в query_log projections = idx_by_transaction_id_wide). Как только в проекции
+-- физически лежат все нужные запросу колонки, а не только ключ, она
+-- становится полноценным кандидатом наравне с prj_order_by_risk — и,
+-- в отличие от него, даёт реальное отсечение по transaction_id.
 ```
 
 ### 2.6 Практика: проверка использования
@@ -2172,14 +2212,6 @@ LIMIT 10;
 ---
 
 ## 8. Использование таблиц и витрин в Datalens
-
-> Раздел написан по документации DataLens (<https://yandex.cloud/ru/docs/datalens/>).
-> В отличие от остальных разделов кукбука шаги в интерфейсе DataLens (создание
-> подключения, датасета, вычисляемого поля, чарта, включение параметризации)
-> руками не прогонялись — терминология и порядок экранов взяты из документации
-> и их стоит перепроверить в актуальном интерфейсе. SQL-часть 8.2
-> (представление и его вызов с параметрами) реально выполнена на базе `test`
-> — результат см. ниже.
 
 В качестве сквозного примера возьмём не саму таблицу `financial_transactions`,
 а представление `financial_transactions_analytics` из 5.1 — то, в котором уже
