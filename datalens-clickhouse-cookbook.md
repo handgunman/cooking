@@ -413,11 +413,9 @@ WHERE merchant_category = 'Travel' -- проверьте наличие комб
   AND country = 'FR'               -- отдельным запросом
 GROUP BY transaction_date
 ORDER BY transaction_date;
--- Ориентировочные параметры выполнения в clickhouse-client
 ```
 
-73 rows in set. Elapsed: 0.066 sec. Processed 2.75 million rows, 79.07 MB (41.33 million rows/s., 1.19 GB/s.)
-Peak memory usage: 19.03 MiB.
+<sub>Ориентировочные параметры выполнения в clickhouse-client:<br>73 rows in set. Elapsed: 0.066 sec. Processed 2.75 million rows, 79.07 MB (41.33 million rows/s., 1.19 GB/s.)<br>Peak memory usage: 19.03 MiB.</sub>
 
 ```sql
 -- Запрос 2: фильтр только по payment_method — не входит в PRIMARY KEY/ORDER BY,
@@ -432,8 +430,7 @@ GROUP BY merchant_category
 ORDER BY total_amount DESC;
 ```
 
-5 rows in set. Elapsed: 0.143 sec. Processed 50.00 million rows, 306.51 MB (350.59 million rows/s., 2.15 GB/s.)
-Peak memory usage: 824.40 KiB.
+<sub>5 rows in set. Elapsed: 0.143 sec. Processed 50.00 million rows, 306.51 MB (350.59 million rows/s., 2.15 GB/s.)<br>Peak memory usage: 824.40 KiB.</sub>
 
 Сравнивать по строке итога в clickhouse-client (время, прочитано строк) либо во
 вкладке метаданных WebSQL.
@@ -584,8 +581,7 @@ GROUP BY merchant_category, country
 ORDER BY revenue DESC;
 ```
 
-30 rows in set. Elapsed: 0.017 sec. Processed 54.10 thousand rows, 3.61 MB (3.12 million rows/s., 208.32 MB/s.)
-Peak memory usage: 937.27 KiB.
+<sub>30 rows in set. Elapsed: 0.017 sec. Processed 54.10 thousand rows, 3.61 MB (3.12 million rows/s., 208.32 MB/s.)<br>Peak memory usage: 937.27 KiB.</sub>
 
 ```sql
 -- Проверка
@@ -599,9 +595,9 @@ SELECT
 FROM financial_transactions
 GROUP BY merchant_category, country
 ORDER BY revenue DESC;
-
--- ReadFromMergeTree (prj_agg_by_category_country)
 ```
+
+<sub>В выводе EXPLAIN: ReadFromMergeTree (prj_agg_by_category_country)</sub>
 
 ```sql
 -- ------------------------------------------------------------
@@ -645,8 +641,7 @@ GROUP BY month, merchant_category
 ORDER BY month;
 ```
 
-27 rows in set. Elapsed: 0.031 sec. Processed 937.86 thousand rows, 44.09 MB (30.25 million rows/s., 1.42 GB/s.)
-Peak memory usage: 11.70 MiB.
+<sub>27 rows in set. Elapsed: 0.031 sec. Processed 937.86 thousand rows, 44.09 MB (30.25 million rows/s., 1.42 GB/s.)<br>Peak memory usage: 11.70 MiB.</sub>
 
 ```sql
 -- Проверка
@@ -662,9 +657,9 @@ GROUP BY
     month,
     merchant_category
 ORDER BY month;
-
--- ReadFromMergeTree (prj_agg_by_account)
 ```
+
+<sub>В выводе EXPLAIN: ReadFromMergeTree (prj_agg_by_account)</sub>
 
 ```sql
 -- ------------------------------------------------------------
@@ -698,8 +693,7 @@ ORDER BY risk_score DESC, amount DESC
 LIMIT 100;
 ```
 
-100 rows in set. Elapsed: 0.053 sec. Processed 5.63 million rows, 94.68 MB (106.19 million rows/s., 1.79 GB/s.)
-Peak memory usage: 14.27 MiB.
+<sub>100 rows in set. Elapsed: 0.053 sec. Processed 5.63 million rows, 94.68 MB (106.19 million rows/s., 1.79 GB/s.)<br>Peak memory usage: 14.27 MiB.</sub>
 
 ```sql
 -- Проверка
@@ -717,9 +711,9 @@ ORDER BY
     risk_score DESC,
     amount DESC
 LIMIT 100
-
--- ReadFromMergeTree (prj_order_by_risk)
 ```
+
+<sub>В выводе EXPLAIN: ReadFromMergeTree (prj_order_by_risk)</sub>
 
 Начиная с версии 25.5 доступны проекции-индексы (projection index): они хранят
 только ключ сортировки и виртуальную колонку `_part_offset`, по которой строки
@@ -753,8 +747,7 @@ FROM financial_transactions
 WHERE transaction_id = 12345678;
 ```
 
-1 rows in set. Elapsed: 0.107 sec. Processed 50.00 million rows, 400.00 MB (467.29 million rows/s., 3.74 GB/s.)
-Peak memory usage: 5.89 MiB.
+<sub>1 rows in set. Elapsed: 0.107 sec. Processed 50.00 million rows, 400.00 MB (467.29 million rows/s., 3.74 GB/s.)<br>Peak memory usage: 5.89 MiB.</sub>
 
 ```sql
 -- ВАЖНО: Для данного распределения данных projection index на _part_offset не является подходящим инструментом.
@@ -783,12 +776,9 @@ FROM financial_transactions
 WHERE transaction_id = 12345678;
 ```
 
-1 row in set. Elapsed: 0.012 sec. Processed 303.10 thousand rows, 2.46 MB (25.16 million rows/s., 204.34 MB/s.)
-Peak memory usage: 1.49 MiB.
+<sub>1 row in set. Elapsed: 0.012 sec. Processed 303.10 thousand rows, 2.46 MB (25.16 million rows/s., 204.34 MB/s.)<br>Peak memory usage: 1.49 MiB.</sub>
 
-```sql
--- Планировщик выбрал idx_by_transaction_id
-```
+Планировщик выбрал idx_by_transaction_id
 
 ### 2.6 Практика: проверка использования
 
@@ -834,13 +824,11 @@ ORDER BY risk_score DESC, amount DESC
 LIMIT 100
 FORMAT Null
 SETTINGS force_optimize_projection_name = 'prj_order_by_risk';
-
--- Ошибки нет — force_optimize_projection_name подтверждает, что
--- prj_order_by_risk реально используется:
 ```
 
-100 rows in set. Elapsed: 0.057 sec. Processed 5.63 million rows, 94.71 MB (98.77 million rows/s., 1.66 GB/s.)
-Peak memory usage: 15.29 MiB.
+Ошибки нет — `force_optimize_projection_name` подтверждает, что `prj_order_by_risk` реально используется:
+
+<sub>100 rows in set. Elapsed: 0.057 sec. Processed 5.63 million rows, 94.71 MB (98.77 million rows/s., 1.66 GB/s.)<br>Peak memory usage: 15.29 MiB.</sub>
 
 ```sql
 -- Проверяем prj_agg_by_category_country
@@ -857,13 +845,13 @@ GROUP BY merchant_category, country
 ORDER BY revenue DESC
 FORMAT Null
 SETTINGS force_optimize_projection_name = 'prj_agg_by_category_country';
--- Если проекция не используется — получим ошибку вида:
--- Exception: Projection prj_agg_by_category_country is specified in setting
--- force_optimize_projection_name, but it is not used.
 ```
 
-30 rows in set. Elapsed: 0.016 sec. Processed 47.38 thousand rows, 3.17 MB (2.96 million rows/s., 197.85 MB/s.)
-Peak memory usage: 4.84 MiB.
+Если проекция не используется — получим ошибку вида:
+
+<sub>Exception: Projection prj_agg_by_category_country is specified in setting force_optimize_projection_name, but it is not used.</sub>
+
+<sub>30 rows in set. Elapsed: 0.016 sec. Processed 47.38 thousand rows, 3.17 MB (2.96 million rows/s., 197.85 MB/s.)<br>Peak memory usage: 4.84 MiB.</sub>
 
 ```sql
 -- Метод 3: system.query_log — реальная статистика после выполнения
@@ -879,14 +867,11 @@ ORDER BY initial_query_start_time DESC
 LIMIT 10;
 ```
 
-10 rows in set. Elapsed: 0.023 sec. Processed 271.41 thousand rows, 3.78 MB (11.80 million rows/s., 164.38 MB/s.)
-Peak memory usage: 10.14 MiB.
+<sub>10 rows in set. Elapsed: 0.023 sec. Processed 271.41 thousand rows, 3.78 MB (11.80 million rows/s., 164.38 MB/s.)<br>Peak memory usage: 10.14 MiB.</sub>
 
-```sql
--- Колонка projections в выводе явно называет использованную проекцию,
--- например <база>.financial_transactions.prj_agg_by_category_country —
--- это самый прямой способ убедиться в выборе оптимизатора постфактум.
-```
+Колонка projections в выводе явно называет использованную проекцию,
+например `<база>.financial_transactions.prj_agg_by_category_country` —
+это самый прямой способ убедиться в выборе оптимизатора постфактум.
 
 ---
 
@@ -933,11 +918,11 @@ EXPLAIN indexes = 1
 SELECT count(), sum(amount)
 FROM financial_transactions
 WHERE transaction_id = 97234;
-
--- В выводе ищем секцию Skip:
--- Parts: 37/114   <- чем меньше левое число, тем лучше работает индекс
--- Granules: 2949/6149
 ```
+
+В выводе ищем секцию `Skip` — чем меньше левое число в `Parts`, тем лучше работает индекс:
+
+<sub>Parts: 37/114<br>Granules: 2949/6149</sub>
 Если индекс не отсекает парты, то, вероятно, значения transaction_id внутри партов не монотонны — то есть порядок вставки не коррелирует с ключом сортировки таблицы.
 
 ### 3.3 Практика: bloom filter и OR по двум колонкам
@@ -995,8 +980,7 @@ WHERE table = 'financial_transactions'
   AND name IN ('sender_account_bf', 'receiver_account_bf');
 ```
 
-2 rows in set. Elapsed: 0.078 sec. Processed 15.00 rows, 1.12 KB (192.31 rows/s., 14.40 KB/s.)
-Peak memory usage: 4.02 MiB.
+<sub>2 rows in set. Elapsed: 0.078 sec. Processed 15.00 rows, 1.12 KB (192.31 rows/s., 14.40 KB/s.)<br>Peak memory usage: 4.02 MiB.</sub>
 
 ```sql
 -- Основной запрос: OR по двум колонкам
@@ -1046,8 +1030,7 @@ WHERE (sender_account_id   = 42345 -- подставьте существующ�
   AND transaction_date BETWEEN today() - INTERVAL 2 YEAR AND today();
 ```
 
-60 rows in set. Elapsed: 0.046 sec. Processed 1.10 million rows, 16.49 MB (23.80 million rows/s., 358.48 MB/s.)
-Peak memory usage: 14.85 MiB.
+<sub>60 rows in set. Elapsed: 0.046 sec. Processed 1.10 million rows, 16.49 MB (23.80 million rows/s., 358.48 MB/s.)<br>Peak memory usage: 14.85 MiB.</sub>
 
 ```sql
 -- Проверка через EXPLAIN: оба Skip индекса должны быть в выводе
@@ -1062,14 +1045,11 @@ FROM financial_transactions
 WHERE (sender_account_id   = 42345 -- подставьте существующее значение
     OR receiver_account_id = 42345)
   AND transaction_date BETWEEN today() - INTERVAL 2 YEAR AND today();
-
---В выводе должна быть секция вида
---Skip
---  Name: <Combined skip indexes>
---  Description: Final set of granules after AND/OR processing
---  Parts: 16/16
---  Granules: 29/853
 ```
+
+В выводе должна быть секция вида:
+
+<sub>Skip<br>&nbsp;&nbsp;Name: &lt;Combined skip indexes&gt;<br>&nbsp;&nbsp;Description: Final set of granules after AND/OR processing<br>&nbsp;&nbsp;Parts: 16/16<br>&nbsp;&nbsp;Granules: 29/853</sub>
 
 ```sql
 -- Замер эффекта: с индексами vs без индексов
@@ -1081,8 +1061,7 @@ FORMAT Null
 SETTINGS use_query_condition_cache = 0;
 ```
 
-60 rows in set. Elapsed: 0.052 sec. Processed 1.10 million rows, 23.91 MB (21.06 million rows/s., 459.89 MB/s.)
-Peak memory usage: 24.75 MiB.
+<sub>60 rows in set. Elapsed: 0.052 sec. Processed 1.10 million rows, 23.91 MB (21.06 million rows/s., 459.89 MB/s.)<br>Peak memory usage: 24.75 MiB.</sub>
 
 ```sql
 SELECT * FROM financial_transactions
@@ -1093,14 +1072,11 @@ FORMAT Null
 SETTINGS use_query_condition_cache = 0, use_skip_indexes = 0;
 ```
 
-64 rows in set. Elapsed: 0.248 sec. Processed 33.52 million rows, 212.40 MB (135.15 million rows/s., 856.44 MB/s.)
-Peak memory usage: 29.67 MiB.
+<sub>64 rows in set. Elapsed: 0.248 sec. Processed 33.52 million rows, 212.40 MB (135.15 million rows/s., 856.44 MB/s.)<br>Peak memory usage: 29.67 MiB.</sub>
 
-```sql
--- Сравнение: без skip-индексов читается почти вся таблица (33.52 млн строк
--- вместо 1.10 млн с индексами) — почти в 31 раз больше данных, запрос
--- примерно в 4.8 раза медленнее.
-```
+Сравнение: без skip-индексов читается почти вся таблица (33.52 млн строк
+вместо 1.10 млн с индексами) — почти в 31 раз больше данных, запрос
+примерно в 4.8 раза медленнее.
 
 ---
 
@@ -1183,8 +1159,7 @@ GROUP BY merchant_category, category_id
 ORDER BY category_id;
 ```
 
-10 rows in set. Elapsed: 1.367 sec. Processed 50.00 million rows, 50.01 MB (36.58 million rows/s., 36.59 MB/s.)
-Peak memory usage: 34.72 MiB.
+<sub>10 rows in set. Elapsed: 1.367 sec. Processed 50.00 million rows, 50.01 MB (36.58 million rows/s., 36.59 MB/s.)<br>Peak memory usage: 34.72 MiB.</sub>
 
 ```sql
 -- Bloom filter на category_id
@@ -1221,8 +1196,7 @@ WHERE table = 'financial_transactions'
   AND name = 'category_id_bf';
 ```
 
-1 rows in set. Elapsed: 0.004 sec. Processed 16.00 rows, 1.20 KB (4.00 thousand rows/s., 299.75 KB/s.)
-Peak memory usage: 4.02 MiB.
+<sub>1 rows in set. Elapsed: 0.004 sec. Processed 16.00 rows, 1.20 KB (4.00 thousand rows/s., 299.75 KB/s.)<br>Peak memory usage: 4.02 MiB.</sub>
 
 ### 4.2 Словарь — более эффективный метод присоединения семантики
 
@@ -1276,8 +1250,7 @@ GROUP BY ft.merchant_category, ft.country
 ORDER BY total_amount DESC;
 ```
 
-6 rows in set. Elapsed: 1.256 sec. Processed 50.00 million rows, 650.02 MB (39.81 million rows/s., 517.53 MB/s.)
-Peak memory usage: 55.57 MiB.
+<sub>6 rows in set. Elapsed: 1.256 sec. Processed 50.00 million rows, 650.02 MB (39.81 million rows/s., 517.53 MB/s.)<br>Peak memory usage: 55.57 MiB.</sub>
 
 ```sql
 -- ============================================================
@@ -1301,14 +1274,11 @@ GROUP BY merchant_category, country
 ORDER BY total_amount DESC;
 ```
 
-6 rows in set. Elapsed: 0.247 sec. Processed 11.69 million rows, 198.68 MB (47.31 million rows/s., 804.36 MB/s.)
-Peak memory usage: 51.05 MiB.
+<sub>6 rows in set. Elapsed: 0.247 sec. Processed 11.69 million rows, 198.68 MB (47.31 million rows/s., 804.36 MB/s.)<br>Peak memory usage: 51.05 MiB.</sub>
 
-```sql
--- Сравнение с вариантом A (JOIN): 11.69 млн строк против 50.00 млн — bloom filter
--- на category_id отсекает лишние гранулы ещё до lookup, запрос быстрее
--- примерно в 5 раз (0.247 сек против 1.256 сек).
-```
+Сравнение с вариантом A (JOIN): 11.69 млн строк против 50.00 млн — bloom filter
+на category_id отсекает лишние гранулы ещё до lookup, запрос быстрее
+примерно в 5 раз (0.247 сек против 1.256 сек).
 
 Почему `dictGet` быстрее JOIN в этом сценарии:
 
@@ -1391,8 +1361,7 @@ FORMAT Null
 SETTINGS use_query_condition_cache = 0;
 ```
 
-6 rows in set. Elapsed: 1.246 sec. Processed 50.00 million rows, 600.02 MB (40.13 million rows/s., 481.55 MB/s.)
-Peak memory usage: 41.28 MiB.
+<sub>6 rows in set. Elapsed: 1.246 sec. Processed 50.00 million rows, 600.02 MB (40.13 million rows/s., 481.55 MB/s.)<br>Peak memory usage: 41.28 MiB.</sub>
 
 ```sql
 -- (кэши не сбрасывались перед замером — SYSTEM DROP CACHE недоступен
@@ -1412,8 +1381,7 @@ FORMAT Null
 SETTINGS use_query_condition_cache = 0;
 ```
 
-6 rows in set. Elapsed: 0.219 sec. Processed 11.69 million rows, 186.99 MB (53.36 million rows/s., 853.85 MB/s.)
-Peak memory usage: 44.40 MiB.
+<sub>6 rows in set. Elapsed: 0.219 sec. Processed 11.69 million rows, 186.99 MB (53.36 million rows/s., 853.85 MB/s.)<br>Peak memory usage: 44.40 MiB.</sub>
 
 ```sql
 -- dictGet без bloom filter — для чистоты сравнения
@@ -1430,14 +1398,11 @@ FORMAT Null
 SETTINGS use_query_condition_cache = 0, use_skip_indexes = 0;
 ```
 
-6 rows in set. Elapsed: 1.153 sec. Processed 50.00 million rows, 600.02 MB (43.37 million rows/s., 520.40 MB/s.)
-Peak memory usage: 4.86 MiB.
+<sub>6 rows in set. Elapsed: 1.153 sec. Processed 50.00 million rows, 600.02 MB (43.37 million rows/s., 520.40 MB/s.)<br>Peak memory usage: 4.86 MiB.</sub>
 
-```sql
--- Без skip-индексов dictGet читает все 50 млн строк (как и JOIN), а не 11.69 млн —
--- разница во времени против предыдущего замера (0.219 сек) подтверждает вклад
--- именно bloom filter на category_id, а не самого dictGet.
-```
+Без skip-индексов dictGet читает все 50 млн строк (как и JOIN), а не 11.69 млн —
+разница во времени против предыдущего замера (0.219 сек) подтверждает вклад
+именно bloom filter на category_id, а не самого dictGet.
 
 ```sql
 -- Проверка через query_log
@@ -1455,15 +1420,12 @@ ORDER BY initial_query_start_time DESC
 LIMIT 6;
 ```
 
-6 rows in set. Elapsed: 0.015 sec. Processed 272.69 thousand rows, 4.25 MB (18.18 million rows/s., 283.08 MB/s.)
-Peak memory usage: 4.94 MiB.
+<sub>6 rows in set. Elapsed: 0.015 sec. Processed 272.69 thousand rows, 4.25 MB (18.18 million rows/s., 283.08 MB/s.)<br>Peak memory usage: 4.94 MiB.</sub>
 
-```sql
--- В колонке projections видно: JOIN-вариант читался через prj_order_by_risk,
--- а оба dictGet-варианта — напрямую из базовой таблицы ([] в projections).
--- Наличие подходящей проекции не гарантирует её использование именно там,
--- где ожидаешь, — ещё один повод для обязательной проверки из 2.6.
-```
+В колонке projections видно: JOIN-вариант читался через prj_order_by_risk,
+а оба dictGet-варианта — напрямую из базовой таблицы ([] в projections).
+Наличие подходящей проекции не гарантирует её использование именно там,
+где ожидаешь, — ещё один повод для обязательной проверки из 2.6.
 
 ---
 
@@ -1598,15 +1560,12 @@ ORDER BY risk_score DESC, amount DESC
 LIMIT 50;
 ```
 
-50 rows in set. Elapsed: 5.473 sec. Processed 50.00 million rows, 1.30 GB (9.14 million rows/s., 237.54 MB/s.)
-Peak memory usage: 2.09 GiB.
+<sub>50 rows in set. Elapsed: 5.473 sec. Processed 50.00 million rows, 1.30 GB (9.14 million rows/s., 237.54 MB/s.)<br>Peak memory usage: 2.09 GiB.</sub>
 
-```sql
--- Подтверждает предупреждение из текста выше: запрос на порядки дороже
--- single-window запросов из 5.3 — оконные функции считаются по всем строкам
--- status = 'completed' до применения фильтров amount_rank_in_segment
--- и risk_percentile_in_country.
-```
+Подтверждает предупреждение из текста выше: запрос на порядки дороже
+single-window запросов из 5.3 — оконные функции считаются по всем строкам
+status = 'completed' до применения фильтров amount_rank_in_segment
+и risk_percentile_in_country.
 
 ```sql
 -- Проверка плана выполнения
@@ -1647,8 +1606,7 @@ WHERE account_id = 282208 -- сделайте выборку для получе
 ORDER BY transaction_date;
 ```
 
-57 rows in set. Elapsed: 0.064 sec. Processed 50.00 million rows, 252.42 MB (781.25 million rows/s., 3.94 GB/s.)
-Peak memory usage: 6.13 MiB.
+<sub>57 rows in set. Elapsed: 0.064 sec. Processed 50.00 million rows, 252.42 MB (781.25 million rows/s., 3.94 GB/s.)<br>Peak memory usage: 6.13 MiB.</sub>
 
 ```sql
 -- EXPLAIN показывает что PRIMARY KEY не отсекает гранулы по account_id —
@@ -1697,8 +1655,7 @@ FROM financial_transactions
 ORDER BY currency;
 ```
 
-7 rows in set. Elapsed: 0.013 sec. Processed 47.04 thousand rows, 56.73 KB (3.75 million rows/s., 4.52 MB/s.)
-Peak memory usage: 620.91 KiB.
+<sub>7 rows in set. Elapsed: 0.013 sec. Processed 47.04 thousand rows, 56.73 KB (3.75 million rows/s., 4.52 MB/s.)<br>Peak memory usage: 620.91 KiB.</sub>
 
 ```sql
 EXPLAIN indexes = 1
@@ -1713,8 +1670,7 @@ ORDER BY currency
 SETTINGS optimize_use_projections = 0;
 ```
 
-7 rows in set. Elapsed: 0.040 sec. Processed 50.00 million rows, 50.01 MB (1.25 billion rows/s., 1.25 GB/s.)
-Peak memory usage: 4.60 MiB.
+<sub>7 rows in set. Elapsed: 0.040 sec. Processed 50.00 million rows, 50.01 MB (1.25 billion rows/s., 1.25 GB/s.)<br>Peak memory usage: 4.60 MiB.</sub>
 
 ```sql
 SELECT DISTINCT currency
@@ -1722,15 +1678,12 @@ FROM financial_transactions
 ORDER BY currency;
 ```
 
-7 rows in set. Elapsed: 0.013 sec. Processed 47.38 thousand rows, 57.19 KB (3.64 million rows/s., 4.40 MB/s.)
-Peak memory usage: 4.61 MiB.
+<sub>7 rows in set. Elapsed: 0.013 sec. Processed 47.38 thousand rows, 57.19 KB (3.64 million rows/s., 4.40 MB/s.)<br>Peak memory usage: 4.61 MiB.</sub>
 
-```sql
--- EXPLAIN indexes = 1 подтверждает: ReadFromMergeTree (prj_agg_by_category_country),
--- Granules: 116/6149 — читается только проекция, а не 50 млн строк базовой
--- таблицы. В 1000+ раз меньше прочитанных строк и в 3 раза быстрее по
--- времени, хотя запрос и так короткий.
-```
+EXPLAIN indexes = 1 подтверждает: ReadFromMergeTree (prj_agg_by_category_country),
+Granules: 116/6149 — читается только проекция, а не 50 млн строк базовой
+таблицы. В 1000+ раз меньше прочитанных строк и в 3 раза быстрее по
+времени, хотя запрос и так короткий.
 
 ```sql
 -- Проверяем через query_log какая проекция была использована
@@ -1749,14 +1702,11 @@ ORDER BY initial_query_start_time DESC
 LIMIT 4;
 ```
 
-3 rows in set. Elapsed: 0.033 sec. Processed 275.27 thousand rows, 34.28 MB (8.34 million rows/s., 1.04 GB/s.)
-Peak memory usage: 33.33 MiB.
+<sub>3 rows in set. Elapsed: 0.033 sec. Processed 275.27 thousand rows, 34.28 MB (8.34 million rows/s., 1.04 GB/s.)<br>Peak memory usage: 33.33 MiB.</sub>
 
-```sql
--- В строке без SETTINGS optimize_use_projections = 0 поле projections
--- заполнено — <база>.financial_transactions.prj_agg_by_category_country —
--- то же самое, что видно и в EXPLAIN.
-```
+В строке без SETTINGS optimize_use_projections = 0 поле projections
+заполнено — `<база>.financial_transactions.prj_agg_by_category_country` —
+то же самое, что видно и в EXPLAIN.
 
 ---
 
@@ -1854,8 +1804,7 @@ GROUP BY merchant_category, currency
 ORDER BY total_amount DESC;
 ```
 
-4 rows in set. Elapsed: 0.004 sec. Processed 4.00 rows, 155.00 B (1.00 thousand rows/s., 38.75 KB/s.)
-Peak memory usage: 4.23 MiB.
+<sub>4 rows in set. Elapsed: 0.004 sec. Processed 4.00 rows, 155.00 B (1.00 thousand rows/s., 38.75 KB/s.)<br>Peak memory usage: 4.23 MiB.</sub>
 
 ```sql
 -- Backfill исторических данных
@@ -1931,8 +1880,7 @@ GROUP BY country, risk_bucket
 ORDER BY country, risk_bucket;
 ```
 
-45 rows in set. Elapsed: 0.004 sec. Processed 45.00 rows, 3.49 KB (11.25 thousand rows/s., 872.00 KB/s.)
-Peak memory usage: 237.45 KiB.
+<sub>45 rows in set. Elapsed: 0.004 sec. Processed 45.00 rows, 3.49 KB (11.25 thousand rows/s., 872.00 KB/s.)<br>Peak memory usage: 237.45 KiB.</sub>
 
 ### 6.3 Refreshable MV: REPLACE и APPEND
 
@@ -2016,8 +1964,7 @@ GROUP BY status, merchant_category
 ORDER BY total_amount DESC;
 ```
 
-4 rows in set. Elapsed: 0.004 sec. Processed 361.00 rows, 7.40 KB (90.25 thousand rows/s., 1.85 MB/s.)
-Peak memory usage: 4.23 MiB.
+<sub>4 rows in set. Elapsed: 0.004 sec. Processed 361.00 rows, 7.40 KB (90.25 thousand rows/s., 1.85 MB/s.)<br>Peak memory usage: 4.23 MiB.</sub>
 
 ```sql
 -- ------------------------------------------------------------
@@ -2075,15 +2022,12 @@ WHERE snapshot_ts >= now() - INTERVAL 24 HOUR
 ORDER BY snapshot_ts ASC, country;
 ```
 
-9 rows in set. Elapsed: 0.005 sec. Processed 9.00 rows, 287.00 B (1.80 thousand rows/s., 57.40 KB/s.)
-Peak memory usage: 4.20 MiB.
+<sub>9 rows in set. Elapsed: 0.005 sec. Processed 9.00 rows, 287.00 B (1.80 thousand rows/s., 57.40 KB/s.)<br>Peak memory usage: 4.20 MiB.</sub>
 
-```sql
--- 9, а не 15 стран — потому что в срез transaction_date >= today() - INTERVAL 7 DAY
--- попадают только страны, для которых в сквозной генерации 1.6
--- (today() - 1095 + rand() % 1095, максимум — «вчера») или в тестовой
--- вставке из 6.1 (today(), страны US/DE/FR) нашлись строки за последнюю неделю.
-```
+9, а не 15 стран — потому что в срез transaction_date >= today() - INTERVAL 7 DAY
+попадают только страны, для которых в сквозной генерации 1.6
+(today() - 1095 + rand() % 1095, максимум — «вчера») или в тестовой
+вставке из 6.1 (today(), страны US/DE/FR) нашлись строки за последнюю неделю.
 
 ### 6.4 Что выбирать
 
@@ -2122,13 +2066,10 @@ GROUP BY user
 ORDER BY total_elapsed_sec DESC;
 ```
 
-1 rows in set. Elapsed: 0.004 sec. Processed 1.00 rows, 3.38 KB (250.00 rows/s., 843.75 KB/s.)
-Peak memory usage: 4.02 MiB.
+<sub>1 rows in set. Elapsed: 0.004 sec. Processed 1.00 rows, 3.38 KB (250.00 rows/s., 843.75 KB/s.)<br>Peak memory usage: 4.02 MiB.</sub>
 
-```sql
--- Если других активных сессий нет, в выводе будет только сам этот запрос:
--- system.processes показывает срез на текущий момент, а не историю.
-```
+Если других активных сессий нет, в выводе будет только сам этот запрос:
+system.processes показывает срез на текущий момент, а не историю.
 
 ```sql
 -- Куда упирается система: CPU vs IO vs Memory
@@ -2163,15 +2104,12 @@ GROUP BY minute
 ORDER BY minute DESC;
 ```
 
-31 rows in set. Elapsed: 0.016 sec. Processed 272.38 thousand rows, 1.48 MB (17.02 million rows/s., 92.20 MB/s.)
-Peak memory usage: 4.49 MiB.
+<sub>31 rows in set. Elapsed: 0.016 sec. Processed 272.38 thousand rows, 1.48 MB (17.02 million rows/s., 92.20 MB/s.)<br>Peak memory usage: 4.49 MiB.</sub>
 
-```sql
--- hasAny() ищет точное совпадение строки, а в system.query_log таблица
--- записана с префиксом БД — сравнивать нужно с полным именем
--- (currentDatabase() || '.financial_transactions'), иначе ft_queries
--- всегда будет 0.
-```
+hasAny() ищет точное совпадение строки, а в system.query_log таблица
+записана с префиксом БД — сравнивать нужно с полным именем
+(currentDatabase() || '.financial_transactions'), иначе ft_queries
+всегда будет 0.
 
 ```sql
 -- Топ тяжёлых запросов за период
@@ -2198,20 +2136,17 @@ ORDER BY total_cpu_sec DESC
 LIMIT 20;
 ```
 
-20 rows in set. Elapsed: 0.020 sec. Processed 271.90 thousand rows, 3.20 MB (13.60 million rows/s., 160.11 MB/s.)
-Peak memory usage: 5.31 MiB.
+<sub>20 rows in set. Elapsed: 0.020 sec. Processed 271.90 thousand rows, 3.20 MB (13.60 million rows/s., 160.11 MB/s.)<br>Peak memory usage: 5.31 MiB.</sub>
 
-```sql
--- На реальном шэренном инстансе Managed Service в топ-20 по total_cpu_sec
--- попадают и запросы других пользователей кластера — сама эта метрика
--- (сумма времени всех выполнений) для того и нужна, чтобы такие запросы
--- не терялись за max_ms одного запроса. Строки, относящиеся к примерам
--- этого кукбука, выглядят так:
---   avg_ms=5473, max_memory=2.09 GiB, avg_rows_read=50.00 million — запрос из 5.2
---     (view + несколько оконных функций)
---   avg_ms=1153, avg_rows_read=50.00 million — dictGet без skip-индексов из 4.4
---   avg_ms=804,  avg_rows_read=50.00 million — backfill INSERT в 6.1
-```
+На реальном шэренном инстансе Managed Service в топ-20 по total_cpu_sec
+попадают и запросы других пользователей кластера — сама эта метрика
+(сумма времени всех выполнений) для того и нужна, чтобы такие запросы
+не терялись за max_ms одного запроса. Строки, относящиеся к примерам
+этого кукбука, выглядят так:
+
+- `avg_ms=5473`, `max_memory=2.09 GiB`, `avg_rows_read=50.00 million` — запрос из 5.2 (view + несколько оконных функций)
+- `avg_ms=1153`, `avg_rows_read=50.00 million` — dictGet без skip-индексов из 4.4
+- `avg_ms=804`, `avg_rows_read=50.00 million` — backfill INSERT в 6.1
 
 ```sql
 -- Конкурентность: пиковая нагрузка по временным слотам
@@ -2232,15 +2167,12 @@ GROUP BY minute
 ORDER BY minute DESC;
 ```
 
-121 rows in set. Elapsed: 0.013 sec. Processed 272.42 thousand rows, 1.84 MB (20.96 million rows/s., 141.25 MB/s.)
-Peak memory usage: 4.41 MiB.
+<sub>121 rows in set. Elapsed: 0.013 sec. Processed 272.42 thousand rows, 1.84 MB (20.96 million rows/s., 141.25 MB/s.)<br>Peak memory usage: 4.41 MiB.</sub>
 
-```sql
--- На шэренном managed-инстансе в выводе видна устойчивая фоновая активность
--- (десятки запросов в минуту), не связанная с примерами кукбука. Учитывайте
--- это при интерпретации пиков: без фильтра по своему пользователю или по
--- своей таблице картина смешивает вашу нагрузку с чужой.
-```
+На шэренном managed-инстансе в выводе видна устойчивая фоновая активность
+(десятки запросов в минуту), не связанная с примерами кукбука. Учитывайте
+это при интерпретации пиков: без фильтра по своему пользователю или по
+своей таблице картина смешивает вашу нагрузку с чужой.
 
 ```sql
 -- Ожидания на мержах и вставках (конкуренция за ресурсы)
@@ -2356,8 +2288,7 @@ SELECT count()
 FROM financial_transactions_top_by_country(country = 'US', min_risk_percentile = 0.9);
 ```
 
-1 rows in set. Elapsed: 3.662 sec. Processed 50.00 million rows, 700.02 MB (13.65 million rows/s., 191.16 MB/s.)
-Peak memory usage: 545.29 MiB.
+<sub>1 rows in set. Elapsed: 3.662 sec. Processed 50.00 million rows, 700.02 MB (13.65 million rows/s., 191.16 MB/s.)<br>Peak memory usage: 545.29 MiB.</sub>
 
 
 В датасете DataLens источник тогда выглядит так (кавычки для `country`
