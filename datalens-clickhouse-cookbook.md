@@ -2304,8 +2304,8 @@ FROM financial_transactions_top_by_country(
 ```
 
 
+### Очистка тестовых структур ###
 
-Зачистка
 ```sql
 -- Шаг 1: Удаляем все Materialized Views (зависимые объекты первыми)
 DROP VIEW IF EXISTS financial_transactions_daily_summary_mv;
