@@ -66,10 +66,10 @@
   - 6.2 AggregatingMergeTree и состояния агрегатов
   - 6.3 Refreshable MV: REPLACE и APPEND
   - 6.4 Что выбирать
-- 7. Мониторинг BI-нагрузки
-- 8. Использование таблиц и витрин в Datalens
-  - 8.1 Практика: датасет и чарт на представлении с оконными функциями
-  - 8.2 Задел: параметры датасета и параметризированные представления в БД
+- 7. Использование таблиц и витрин в Datalens
+  - 7.1 Практика: датасет и чарт на представлении с оконными функциями
+  - 7.2 Задел: параметры датасета и параметризированные представления в БД
+- 8. Мониторинг BI-нагрузки
 
 ---
 
@@ -771,10 +771,7 @@ LIMIT 100
 
 > <sub>В выводе EXPLAIN: ReadFromMergeTree (prj_order_by_risk)</sub>
 
-Начиная с версии 25.5 доступны проекции-индексы (projection index): они хранят
-только ключ сортировки и виртуальную колонку `_part_offset`, по которой строки
-читаются из базовой таблицы. Компактный синтаксис `INDEX ... TYPE basic` из
-примера ниже доступен с версии 26.1.
+Проекции-индексы (projection index) хранят только ключ сортировки и виртуальную колонку _part_offset, по которой строки читаются из базовой таблицы. В примере ниже используется компактный синтаксис INDEX ... TYPE basic
 
 ```sql
 -- ------------------------------------------------------------
@@ -1291,7 +1288,7 @@ LIFETIME(MIN 300 MAX 900);
 -- затем проверяет каждую строку financial_transactions.
 -- Фильтр по risk_tier применяется ПОСЛЕ джойна.
 --
--- Начиная с версии 25.10 ClickHouse автоматически строит runtime bloom filter
+-- ClickHouse автоматически строит runtime bloom filter
 -- из правой части JOIN (merchant_category_dict_source) и передаёт его
 -- в сканирование левой части (financial_transactions) ещё до джойна.
 -- Это позволяет отсечь строки financial_transactions у которых category_id
@@ -2113,7 +2110,137 @@ ORDER BY snapshot_ts ASC, country;
 
 ---
 
-## 7. Мониторинг BI-нагрузки
+## 7. Использование таблиц и витрин в Datalens
+
+В качестве сквозного примера возьмём не саму таблицу `financial_transactions`,
+а представление `financial_transactions_analytics` из 5.1 — то, в котором уже
+посчитаны оконные функции (`amount_rank_in_segment`, `risk_percentile_in_country`
+и т.д.). Идея та же, что и в разделе 5: BI получает уже готовые колонки и не
+должен ничего досчитывать сам.
+
+### 7.1 Практика: датасет и чарт на представлении с оконными функциями
+
+**1. Подключение.** Если подключение к этому ClickHouse в DataLens ещё не
+создано — **Подключения → Создать подключение → ClickHouse®**. Для
+Managed Service указываются хост, порт HTTP-интерфейса, пользователь и
+пароль; для BI имеет смысл заводить отдельного пользователя с доступом
+только на чтение (см. 0.1). Уровень доступа SQL-запросов — «SQL на чтение».
+После проверки соединения — **Создать подключение**.
+
+**2. Создание датасета.** На странице подключения — **Создать датасет**.
+В списке таблиц источника выбираем не `financial_transactions`, а
+`financial_transactions_analytics` — представления ClickHouse видны в этом
+списке наравне с обычными таблицами, отдельно выбирать «режим SQL» не
+требуется. Перетаскиваем таблицу на рабочую область, переходим на вкладку
+**Поля**, сохраняем датасет с названием.
+
+**3. Вычисляемое поле.** На вкладке **Поля** — **Добавить поле**. Пример,
+завязанный на уже посчитанные в представлении оконные функции — метка
+риск-сегмента по перцентилю `risk_percentile_in_country`:
+
+```
+IF([risk_percentile_in_country] > 0.9, 'Высокий риск (топ 10%)',
+   IF([risk_percentile_in_country] > 0.5, 'Средний риск', 'Низкий риск'))
+```
+
+Называем поле, например, `Риск-сегмент`, и создаём.
+
+**4. Чарт.** На странице датасета — **Создать чарт**. Раскладка для
+примера: `merchant_category` — в **Измерения** (по оси X), `Риск-сегмент` —
+в **Измерения** как разбивку (легенда/цвет), количество транзакций
+(`count()` по `transaction_id`) — в **Показатели** (ось Y). DataLens при
+этом просто группирует и считает `count()` — сам перцентиль он не считает
+ни разу, вся тяжёлая часть уже отработала в ClickHouse при обращении к
+представлению.
+
+### 7.2 Задел: параметры датасета и параметризированные представления в БД
+
+DataLens умеет передавать значения параметров датасета в SQL-подзапрос
+источника через плейсхолдер `{{имя_параметра}}` — но это
+работает только когда датасет описан произвольным SQL-запросом, а не
+выбором таблицы из списка (как в 8.1). Порядок в общих чертах:
+
+1. В датасете включить параметризацию, на вкладке **Параметры** добавить
+   параметр (название, тип, значение по умолчанию), включить для него
+   **Разрешить использовать в настройке источника**.
+2. В SQL-запросе источника подставить `{{имя_параметра}}` — например,
+   в `WHERE` или, как в этом кукбуке, в качестве значения параметра
+   параметризированного представления ClickHouse (в самом ClickHouse это
+   отдельная сущность: `CREATE VIEW ... AS SELECT ... WHERE col = {p:Type}`,
+   вызывается как `view_name(p = значение)`).
+
+Вариант такого представления над `financial_transactions_analytics` — вывод
+топа сегмента по стране с фильтром по минимальному риск-перцентилю,
+задаваемому параметром:
+
+```sql
+CREATE VIEW financial_transactions_top_by_country AS
+SELECT
+    transaction_id,
+    account_id,
+    merchant_category,
+    country,
+    transaction_date,
+    amount,
+    risk_score,
+    amount_rank_in_segment,
+    risk_percentile_in_country
+FROM financial_transactions_analytics
+WHERE country = {country:String}
+  AND risk_percentile_in_country >= {min_risk_percentile:Float64}
+ORDER BY amount_rank_in_segment;
+```
+
+Проверка из `clickhouse-client`:
+
+```sql
+SELECT count()
+FROM financial_transactions_top_by_country(country = 'US', min_risk_percentile = 0.9);
+```
+
+> <sub>1 rows in set. Elapsed: 3.662 sec. Processed 50.00 million rows, 700.02 MB (13.65 million rows/s., 191.16 MB/s.)<br>Peak memory usage: 545.29 MiB.</sub>
+
+
+В датасете DataLens источник тогда выглядит так (кавычки для `country`
+нужны явно — `{{...}}` в DataLens это текстовая подстановка, а не
+параметр с типом):
+
+```sql
+SELECT *
+FROM financial_transactions_top_by_country(
+    country = '{{country_param}}',
+    min_risk_percentile = {{min_risk_percentile_param}}
+);
+```
+
+
+### Очистка тестовых структур ###
+
+```sql
+-- Шаг 1: Удаляем все Materialized Views (зависимые объекты первыми)
+DROP VIEW IF EXISTS financial_transactions_daily_summary_mv;
+DROP VIEW IF EXISTS financial_transactions_risk_by_country_mv;
+DROP VIEW IF EXISTS financial_transactions_risk_snapshots_mv;
+DROP VIEW IF EXISTS financial_transactions_status_report_mv;
+
+-- Шаг 2: Удаляем таблицы-получатели (target tables)
+DROP TABLE IF EXISTS financial_transactions_daily_summary;
+DROP TABLE IF EXISTS financial_transactions_risk_by_country;
+DROP TABLE IF EXISTS financial_transactions_risk_snapshots;
+DROP TABLE IF EXISTS financial_transactions_status_report;
+DROP TABLE IF EXISTS financial_transactions_analytics;
+DROP TABLE IF EXISTS financial_transactions_top_by_country;
+
+-- Шаг 3: Удаляем словари
+DROP DICTIONARY IF EXISTS merchant_category_dict;
+DROP TABLE IF EXISTS merchant_category_dict_source;
+
+-- Шаг 4: Удаляем исходную таблицу (source table) последней
+DROP TABLE IF EXISTS financial_transactions;
+```
+---
+
+## 8. Мониторинг BI-нагрузки
 
 Ключевой момент для BI-нагрузки: смотрите на `total_cpu_sec` (сумма времени всех
 выполнений одного типа запроса), а не на `max_ms` отдельного запроса — именно
@@ -2271,131 +2398,15 @@ LIMIT 10;
 
 ---
 
-## 8. Использование таблиц и витрин в Datalens
+## Чек-лист подготовки данных для DataLens
 
-В качестве сквозного примера возьмём не саму таблицу `financial_transactions`,
-а представление `financial_transactions_analytics` из 5.1 — то, в котором уже
-посчитаны оконные функции (`amount_rank_in_segment`, `risk_percentile_in_country`
-и т.д.). Идея та же, что и в разделе 5: BI получает уже готовые колонки и не
-должен ничего досчитывать сам.
-
-### 8.1 Практика: датасет и чарт на представлении с оконными функциями
-
-**1. Подключение.** Если подключение к этому ClickHouse в DataLens ещё не
-создано — **Подключения → Создать подключение → ClickHouse®**. Для
-Managed Service указываются хост, порт HTTP-интерфейса, пользователь и
-пароль; для BI имеет смысл заводить отдельного пользователя с доступом
-только на чтение (см. 0.1). Уровень доступа SQL-запросов — «SQL на чтение».
-После проверки соединения — **Создать подключение**.
-
-**2. Создание датасета.** На странице подключения — **Создать датасет**.
-В списке таблиц источника выбираем не `financial_transactions`, а
-`financial_transactions_analytics` — представления ClickHouse видны в этом
-списке наравне с обычными таблицами, отдельно выбирать «режим SQL» не
-требуется. Перетаскиваем таблицу на рабочую область, переходим на вкладку
-**Поля**, сохраняем датасет с названием.
-
-**3. Вычисляемое поле.** На вкладке **Поля** — **Добавить поле**. Пример,
-завязанный на уже посчитанные в представлении оконные функции — метка
-риск-сегмента по перцентилю `risk_percentile_in_country`:
-
-```
-IF([risk_percentile_in_country] > 0.9, 'Высокий риск (топ 10%)',
-   IF([risk_percentile_in_country] > 0.5, 'Средний риск', 'Низкий риск'))
-```
-
-Называем поле, например, `Риск-сегмент`, и создаём.
-
-**4. Чарт.** На странице датасета — **Создать чарт**. Раскладка для
-примера: `merchant_category` — в **Измерения** (по оси X), `Риск-сегмент` —
-в **Измерения** как разбивку (легенда/цвет), количество транзакций
-(`count()` по `transaction_id`) — в **Показатели** (ось Y). DataLens при
-этом просто группирует и считает `count()` — сам перцентиль он не считает
-ни разу, вся тяжёлая часть уже отработала в ClickHouse при обращении к
-представлению.
-
-### 8.2 Задел: параметры датасета и параметризированные представления в БД
-
-DataLens умеет передавать значения параметров датасета в SQL-подзапрос
-источника через плейсхолдер `{{имя_параметра}}` — но это
-работает только когда датасет описан произвольным SQL-запросом, а не
-выбором таблицы из списка (как в 8.1). Порядок в общих чертах:
-
-1. В датасете включить параметризацию, на вкладке **Параметры** добавить
-   параметр (название, тип, значение по умолчанию), включить для него
-   **Разрешить использовать в настройке источника**.
-2. В SQL-запросе источника подставить `{{имя_параметра}}` — например,
-   в `WHERE` или, как в этом кукбуке, в качестве значения параметра
-   параметризированного представления ClickHouse (в самом ClickHouse это
-   отдельная сущность: `CREATE VIEW ... AS SELECT ... WHERE col = {p:Type}`,
-   вызывается как `view_name(p = значение)`).
-
-Вариант такого представления над `financial_transactions_analytics` — вывод
-топа сегмента по стране с фильтром по минимальному риск-перцентилю,
-задаваемому параметром:
-
-```sql
-CREATE VIEW financial_transactions_top_by_country AS
-SELECT
-    transaction_id,
-    account_id,
-    merchant_category,
-    country,
-    transaction_date,
-    amount,
-    risk_score,
-    amount_rank_in_segment,
-    risk_percentile_in_country
-FROM financial_transactions_analytics
-WHERE country = {country:String}
-  AND risk_percentile_in_country >= {min_risk_percentile:Float64}
-ORDER BY amount_rank_in_segment;
-```
-
-Проверка из `clickhouse-client`:
-
-```sql
-SELECT count()
-FROM financial_transactions_top_by_country(country = 'US', min_risk_percentile = 0.9);
-```
-
-> <sub>1 rows in set. Elapsed: 3.662 sec. Processed 50.00 million rows, 700.02 MB (13.65 million rows/s., 191.16 MB/s.)<br>Peak memory usage: 545.29 MiB.</sub>
-
-
-В датасете DataLens источник тогда выглядит так (кавычки для `country`
-нужны явно — `{{...}}` в DataLens это текстовая подстановка, а не
-параметр с типом):
-
-```sql
-SELECT *
-FROM financial_transactions_top_by_country(
-    country = '{{country_param}}',
-    min_risk_percentile = {{min_risk_percentile_param}}
-);
-```
-
-
-### Очистка тестовых структур ###
-
-```sql
--- Шаг 1: Удаляем все Materialized Views (зависимые объекты первыми)
-DROP VIEW IF EXISTS financial_transactions_daily_summary_mv;
-DROP VIEW IF EXISTS financial_transactions_risk_by_country_mv;
-DROP VIEW IF EXISTS financial_transactions_risk_snapshots_mv;
-DROP VIEW IF EXISTS financial_transactions_status_report_mv;
-
--- Шаг 2: Удаляем таблицы-получатели (target tables)
-DROP TABLE IF EXISTS financial_transactions_daily_summary;
-DROP TABLE IF EXISTS financial_transactions_risk_by_country;
-DROP TABLE IF EXISTS financial_transactions_risk_snapshots;
-DROP TABLE IF EXISTS financial_transactions_status_report;
-DROP TABLE IF EXISTS financial_transactions_analytics;
-DROP TABLE IF EXISTS financial_transactions_top_by_country;
-
--- Шаг 3: Удаляем словари
-DROP DICTIONARY IF EXISTS merchant_category_dict;
-DROP TABLE IF EXISTS merchant_category_dict_source;
-
--- Шаг 4: Удаляем исходную таблицу (source table) последней
-DROP TABLE IF EXISTS financial_transactions;
-```
+- Настройте `ORDER BY` и `PRIMARY KEY` под реальные паттерны фильтрации.
+- Если для управления данными нужно партиционирование, настройте его так, чтобы количество партиций не было избыточным.
+- Проверьте базовую таблицу на типовых BI-запросах и по результатам определите, нужна ли дополнительная оптимизация.
+- Если для запросов нужен другой порядок сортировки, заранее подготовленные агрегаты или дополнительный способ поиска по отдельным полям, используйте projections.
+- Если нужно ускорить фильтрацию по колонкам с подходящим распределением значений и хорошей корреляцией с `ORDER BY`, используйте skip-индексы.
+- Если для аналитики нужны данные из отдельных справочников, используйте `JOIN` или dictionary.
+- Если для аналитики нужны производные показатели, которые можно рассчитывать при запросе, используйте `VIEW`.
+- Если рассчитывать производные показатели при каждом обращении к `VIEW` слишком затратно, подготовьте результаты заранее с помощью Materialized View.
+- Если агрегаты нужно обновлять при каждом `INSERT`, используйте инкрементальный Materialized View, если нужен полный пересчёт по расписанию — Refreshable Materialized View.
+- После подключения к DataLens проверьте реальную BI-нагрузку с учётом запросов от чартов и селекторов.
